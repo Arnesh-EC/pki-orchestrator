@@ -1,0 +1,16 @@
+# Copy this to orchestrator.toml and adjust for local dev.
+# orchestrator.toml is gitignored — never commit real identity/backend values.
+
+[identity]
+vm_id = "dev-local"
+role = "operator" # "operator" | "guest"
+
+[backend]
+# url = "https://pki-playground.example.com"  # unused in v0 — no networking code reads this yet
+
+[execution]
+# shell_binary = "pwsh"        # defaults to "powershell.exe" on Windows, "pwsh" elsewhere
+# script_timeout_secs = 900
+
+[service]
+# log_level = "info"
