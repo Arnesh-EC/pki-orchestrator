@@ -106,10 +106,18 @@ fn run_service() -> Result<()> {
 
     let config = crate::config::OrchestratorConfig::load_default()
         .context("loading service config")?;
-    super::console::run_loop(&config)?;
 
-    // v0 has no ongoing async work (no backend connection yet), so just
-    // wait for a stop signal from the SCM.
+    // The phone-home loop never returns in normal operation, so it runs on
+    // its own thread; this thread's only job is waiting for a stop signal
+    // from the SCM. The loop's connection is torn down when the process
+    // exits after this function returns — there is no graceful in-loop
+    // shutdown signal wired up yet (v0 scope).
+    std::thread::spawn(move || {
+        if let Err(err) = super::console::run_loop(&config) {
+            tracing::error!(?err, "phone-home loop exited");
+        }
+    });
+
     let _ = shutdown_rx.recv();
 
     status_handle.set_service_status(ServiceStatus {

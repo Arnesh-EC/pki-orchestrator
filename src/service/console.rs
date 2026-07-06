@@ -1,22 +1,35 @@
-//! The core run-loop body, shared by both the console dev/CI path and the
-//! real Windows-Service-invoked path (see `service::scm`). There is exactly
-//! one control-flow implementation, not two.
+//! The core run-loop body, shared by both the console dev/CI path (`connect`
+//! CLI subcommand) and the real Windows-Service-invoked path (see
+//! `service::scm`). There is exactly one control-flow implementation, not
+//! two.
 //!
-//! v0 has no backend connection yet, so this just proves the registry/config
-//! wiring is sound and returns; the networking phase will replace this with
-//! a phone-home + command-listen loop.
+//! This bridges the sync CLI/SCM entry points to the async phone-home loop
+//! (`crate::phonehome::run_forever`) with a dedicated Tokio runtime — the
+//! rest of the crate stays synchronous; only the networking layer is async.
 
-use anyhow::Result;
+use std::sync::Arc;
 
-use crate::{commands::build_default_registry, config::OrchestratorConfig};
+use anyhow::{Context, Result};
+
+use crate::{
+    commands::build_default_registry,
+    config::OrchestratorConfig,
+    phonehome,
+    powershell::{PowerShellExecutor, RealPowerShell}
+};
 
 pub fn run_loop(config: &OrchestratorConfig) -> Result<()> {
-    let registry = build_default_registry();
+    let registry = Arc::new(build_default_registry());
+    let shell: Arc<dyn PowerShellExecutor> =
+        Arc::new(RealPowerShell::new(config.execution.shell_binary.clone()));
+
     tracing::info!(
         vm_id = %config.identity.vm_id,
-        role = ?config.identity.role,
         command_count = registry.len(),
-        "orchestrator started (v0: idle — no backend connection yet)"
+        "orchestrator connecting to backend"
     );
-    Ok(())
+
+    let runtime = tokio::runtime::Runtime::new()
+        .context("building the phone-home tokio runtime")?;
+    runtime.block_on(phonehome::run_forever(config, registry, shell))
 }

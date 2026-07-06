@@ -45,6 +45,13 @@ pub enum Command {
     Service {
         #[command(subcommand)]
         action: ServiceAction
+    },
+    /// Phone home to the backend and serve dispatched commands. Works on
+    /// any OS — the dev/Linux-testable path for what `service run` does on
+    /// Windows under the SCM.
+    Connect {
+        #[arg(long, default_value = "orchestrator.toml")]
+        config: PathBuf
     }
 }
 
@@ -75,8 +82,17 @@ pub fn run(cli: Cli) -> Result<()> {
             command,
             params
         } => run_once(&config, &command, params),
-        Command::Service { action } => crate::service::handle(action)
+        Command::Service { action } => crate::service::handle(action),
+        Command::Connect { config } => connect(&config)
     }
+}
+
+fn connect(config_path: &Path) -> Result<()> {
+    let config =
+        OrchestratorConfig::load_from_file(config_path).with_context(|| {
+            format!("loading config from {}", config_path.display())
+        })?;
+    crate::service::console::run_loop(&config)
 }
 
 fn run_once(
