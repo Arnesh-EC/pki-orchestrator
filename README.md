@@ -22,15 +22,19 @@ scenes, streaming progress back to the frontend.
 Windows Server is the only target for now; Linux support is a stated future
 goal.
 
-## Out of scope for v0
+## Out of scope for v0 / v1
 
-This is the first commit of a new repo. It proves the core architecture —
-role-gated command dispatch, PowerShell execution, Windows Service
-lifecycle — with a small, real, testable slice. It deliberately does **not**
-yet include:
+v0 proved the core architecture — role-gated command dispatch, PowerShell
+execution, Windows Service lifecycle — with a small, real, testable slice
+and no networking at all. v1 (this revision) wires up the actual phone-home
+mechanism: the orchestrator connects out to the backend, receives dispatched
+commands, and streams their progress back — see "Phone-home" below. Still
+deliberately **not** included:
 
-- Any network connection to the EC-PKI-Playground backend ("phone home").
-  `backend.url` exists in the config schema but nothing reads it yet.
+- **Automatic, ISO-embedded registration.** The backend-issued `vm_id`/
+  `agent_token` pair (see below) is copied into `orchestrator.toml` by a
+  human today, standing in for what a real deployment will do automatically
+  once the `isokit`/`configgen` gaps below close.
 - The full ADCS command catalog from `vm-building.md` (AD DS forest
   promotion, CA install, template publishing, OCSP configuration, etc.) —
   only 3 commands are implemented, chosen to exercise every point on the role
@@ -48,13 +52,40 @@ need rediscovering later:
   binary-embedding API there.
 - **vmkit** has no guest-level communication (no VMware Tools/VIX guest-exec,
   no IP/hostname readback) — there is no existing way for the backend to
-  correlate an inbound "phone home" call to a specific VM record. This is why
-  `identity.vm_id` exists in the config schema now: it's a placeholder for a
-  shared correlation token baked into the config ISO and echoed back on
-  phone-home.
+  correlate an inbound "phone home" call to a specific VM record. `vm_id` +
+  `agent_token` (see "Phone-home" below) are the correlation mechanism that
+  will eventually be baked into the config ISO automatically; today they're
+  copied in by hand.
 - **configgen** has no plugin/extension point for emitting an "install the
   orchestrator" first-boot step — only hostname/network/local-password
   renderers exist today.
+
+## Phone-home
+
+`connect` (and, on Windows, `service run`) opens a long-lived WebSocket to
+`{backend.url}/api/orchestrator/connect?vm_id=&token=` and stays connected,
+reconnecting with capped backoff on any drop. Each inbound frame is a
+dispatched command tagged with a job id and the role the backend
+authenticated the calling human as:
+
+```json
+{"job_id": "...", "command": "cert.verify", "params": {"path": "..."}, "role": "guest"}
+```
+
+The **backend is the authoritative capability gate** — it checks the human's
+role via its own `require_capability` before ever forwarding a command, and
+that forwarded `role` is what `CommandRegistry::dispatch` checks here, not
+`identity.role` from local config (which is only a fallback for the one-shot
+`run` CLI path, which has no backend in the loop). This local dispatch check
+is a second, structural gate, not the primary one.
+
+Progress streams back as `{"job_id": "...", "state": <OpRunState>}` frames,
+which the backend relays onto the existing `/api/ws/jobs/{job_id}` transport
+— no new frontend plumbing needed to watch it.
+
+Get a `vm_id`/`agent_token` pair via `POST /api/orchestrator/register` on the
+backend before running `connect`; see the backend's own docs for the request
+shape.
 
 ## Command surface (v0)
 
@@ -104,14 +135,23 @@ validated:
   out rather than binding COM, since every v0 command has a plain PowerShell
   equivalent and this is what's testable from a non-Windows dev machine.
 - `commands/` — the 3 v0 handlers.
-- `cli.rs` — the `run` / `service` subcommands; `run` is the dev/CI path
-  exercised on any OS, dispatching one command and printing its `OpRunState`
-  progress as JSON lines followed by the final result.
-- `service/` — `console.rs` holds the run-loop body shared by both the
-  console `run` path and the real SCM-invoked path, so there is exactly one
-  control-flow implementation. `scm.rs` (Windows-only, `cfg(windows)`) wraps
-  the `windows-service` crate for `service {install,uninstall,run}` — not
-  compiled on Linux, so it's validated by CI's `windows-latest` job.
+- `phonehome.rs` — the WebSocket client: connects, dispatches inbound
+  commands via `spawn_blocking` (dispatch/PowerShell execution are
+  synchronous and must not block the async reactor), streams `OpRunState`
+  progress back, reconnects with capped backoff. `handle_command` (the
+  framing/dispatch translation) is a plain sync function, unit-tested with
+  an in-memory channel standing in for the socket.
+- `cli.rs` — `run` (one-shot local dispatch, no backend), `connect` (phone
+  home and serve commands, any OS), `service` (Windows SCM integration).
+- `service/` — `console.rs::run_loop` bridges the sync CLI/SCM entry points
+  to the async `phonehome::run_forever` with a dedicated Tokio runtime, and
+  is shared by both the `connect` path and the real SCM-invoked path — one
+  control-flow implementation, not two. `scm.rs` (Windows-only,
+  `cfg(windows)`) wraps the `windows-service` crate for
+  `service {install,uninstall,run}` — not compiled on Linux, so it's
+  validated by CI's `windows-latest` job. The phone-home loop runs on its
+  own thread there since it never returns in normal operation; the SCM
+  thread only waits for a stop signal (no in-loop graceful shutdown yet).
 
 ## Usage
 
@@ -132,7 +172,15 @@ cargo run -- run powershell.exec_arbitrary --param script="echo hi"
 # Error: role Guest lacks capability VmExecArbitrary required by 'powershell.exec_arbitrary'
 ```
 
-On Windows, to install as a service:
+To phone home instead of dispatching locally, fill in `identity.vm_id`,
+`identity.agent_token`, and `backend.url` (from `POST /api/orchestrator/register`
+on the backend) in `orchestrator.toml`, then:
+
+```sh
+cargo run -- connect --config orchestrator.toml
+```
+
+On Windows, to install as a service (which calls the same phone-home loop):
 
 ```powershell
 pki-orchestrator.exe service install
@@ -140,9 +188,13 @@ pki-orchestrator.exe service install
 
 ## Testing
 
-`cargo test` runs everything that doesn't require a real Windows box or a
-live shell: config parsing, capability/role gating (including the guest ↔
-`VmExecArbitrary` invariant), and all 3 command handlers driven through a
-mock PowerShell executor. Real `powershell.exe` invocation and Windows
-Service Control Manager lifecycle are exercised only in CI's `windows-latest`
-job / manual testing — see the CI workflow for what actually runs where.
+`cargo test` runs everything that doesn't require a real Windows box, a live
+shell, or a live backend: config parsing, capability/role gating (including
+the guest ↔ `VmExecArbitrary` invariant), all 3 command handlers driven
+through a mock PowerShell executor, and the phone-home framing/dispatch
+translation (`phonehome::handle_command`) driven through an in-memory
+channel. Real `powershell.exe` invocation, a real WebSocket connection to a
+running backend, and Windows Service Control Manager lifecycle are exercised
+only in CI's `windows-latest` job / manual testing — see the CI workflow for
+what actually runs where, and the top-level plan's Verification section for
+the manual end-to-end phone-home walkthrough.
