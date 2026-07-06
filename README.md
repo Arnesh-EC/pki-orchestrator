@@ -104,15 +104,32 @@ validated:
   out rather than binding COM, since every v0 command has a plain PowerShell
   equivalent and this is what's testable from a non-Windows dev machine.
 - `commands/` — the 3 v0 handlers.
-- `service/` — dual-mode binary: `run` (works on any OS, the dev/CI path) and
-  `service {install,uninstall,run}` (Windows Service Control Manager
-  integration via the `windows-service` crate, Windows-only).
+- `cli.rs` — the `run` / `service` subcommands; `run` is the dev/CI path
+  exercised on any OS, dispatching one command and printing its `OpRunState`
+  progress as JSON lines followed by the final result.
+- `service/` — `console.rs` holds the run-loop body shared by both the
+  console `run` path and the real SCM-invoked path, so there is exactly one
+  control-flow implementation. `scm.rs` (Windows-only, `cfg(windows)`) wraps
+  the `windows-service` crate for `service {install,uninstall,run}` — not
+  compiled on Linux, so it's validated by CI's `windows-latest` job.
 
 ## Usage
 
 ```sh
 cp orchestrator.example.toml orchestrator.toml
-cargo run -- run --command cert.verify --param path=C:\win11.cer
+cargo run -- run cert.verify --param path=/path/to/cert.cer
+# {"status":"running","percent":50.0,"phase":"verifying"}
+# {"status":"done","percent":100.0,"result":{"chain_ok":false,"raw":""}}
+# { "chain_ok": false, "raw": "" }
+```
+
+Each `--param key=value` becomes a command parameter; `--config` (default
+`orchestrator.toml`) selects which config file's `role` governs the dispatch.
+A guest-role config rejects `powershell.exec_arbitrary` before any shell runs:
+
+```sh
+cargo run -- run powershell.exec_arbitrary --param script="echo hi"
+# Error: role Guest lacks capability VmExecArbitrary required by 'powershell.exec_arbitrary'
 ```
 
 On Windows, to install as a service:
