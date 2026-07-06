@@ -8,6 +8,7 @@ use std::{
 
 use pki_orchestrator::{
     authz::{Capability, Role},
+    powershell::MockPowerShell,
     registry::{
         CommandContext, CommandError, CommandHandler, CommandRegistry,
         DispatchError
@@ -50,12 +51,21 @@ fn registry_with_spy(
     (registry, calls)
 }
 
+fn mock_shell() -> Arc<dyn pki_orchestrator::powershell::PowerShellExecutor> {
+    Arc::new(MockPowerShell::new())
+}
+
 #[test]
 fn forbidden_role_never_reaches_handler() {
     let (registry, calls) = registry_with_spy(Capability::VmExecArbitrary);
     let sink = NullProgressSink;
-    let result =
-        registry.dispatch("spy.command", Role::Guest, HashMap::new(), &sink);
+    let result = registry.dispatch(
+        "spy.command",
+        Role::Guest,
+        HashMap::new(),
+        &sink,
+        mock_shell()
+    );
     assert!(matches!(result, Err(DispatchError::Forbidden { .. })));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
@@ -64,8 +74,13 @@ fn forbidden_role_never_reaches_handler() {
 fn allowed_role_reaches_handler() {
     let (registry, calls) = registry_with_spy(Capability::VmRead);
     let sink = NullProgressSink;
-    let result =
-        registry.dispatch("spy.command", Role::Guest, HashMap::new(), &sink);
+    let result = registry.dispatch(
+        "spy.command",
+        Role::Guest,
+        HashMap::new(),
+        &sink,
+        mock_shell()
+    );
     assert!(result.is_ok());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -78,7 +93,8 @@ fn unknown_command_is_reported() {
         "does.not.exist",
         Role::Operator,
         HashMap::new(),
-        &sink
+        &sink,
+        mock_shell()
     );
     assert!(matches!(result, Err(DispatchError::UnknownCommand(_))));
 }
@@ -87,8 +103,13 @@ fn unknown_command_is_reported() {
 fn guest_specifically_cannot_reach_exec_arbitrary_gate() {
     let (registry, calls) = registry_with_spy(Capability::VmExecArbitrary);
     let sink = NullProgressSink;
-    let result =
-        registry.dispatch("spy.command", Role::Guest, HashMap::new(), &sink);
+    let result = registry.dispatch(
+        "spy.command",
+        Role::Guest,
+        HashMap::new(),
+        &sink,
+        mock_shell()
+    );
     assert!(matches!(
         result,
         Err(DispatchError::Forbidden {
