@@ -40,7 +40,22 @@ pub enum Command {
         /// key=value, repeatable.
         #[arg(long = "param")]
         params: Vec<String>
+    },
+    /// Windows Service Control Manager integration (Windows-only).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction
     }
+}
+
+#[derive(Subcommand, Clone, Copy)]
+pub enum ServiceAction {
+    /// Register this binary with the SCM.
+    Install,
+    /// Remove this binary's registration from the SCM.
+    Uninstall,
+    /// Entry point the SCM actually launches (also runnable directly).
+    Run
 }
 
 struct StdoutProgressSink;
@@ -59,7 +74,8 @@ pub fn run(cli: Cli) -> Result<()> {
             config,
             command,
             params
-        } => run_once(&config, &command, params)
+        } => run_once(&config, &command, params),
+        Command::Service { action } => crate::service::handle(action)
     }
 }
 

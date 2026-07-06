@@ -9,3 +9,4 @@ pub mod config;
 pub mod powershell;
 pub mod registry;
 pub mod report;
+pub mod service;
