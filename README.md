@@ -37,8 +37,8 @@ deliberately **not** included:
   once the `isokit`/`configgen` gaps below close.
 - The full ADCS command catalog from `vm-building.md` (AD DS forest
   promotion, CA install, template publishing, OCSP configuration, etc.) —
-  only 3 commands are implemented, chosen to exercise every point on the role
-  spectrum (see below).
+  the implemented set is the 3 v0 commands chosen to exercise every point on
+  the role spectrum, plus the hostname/IP read-write parity set (see below).
 - Packaging/deployment integration with `configgen`/`isokit`/`vmkit`.
 
 ## Future integration points
@@ -87,13 +87,20 @@ Get a `vm_id`/`agent_token` pair via `POST /api/orchestrator/register` on the
 backend before running `connect`; see the backend's own docs for the request
 shape.
 
-## Command surface (v0)
+## Command surface
 
 | Command | Capability | Guest-eligible? | Source |
 |---|---|---|---|
 | `hostname.rename` | `VmUpdate` | No | `Rename-Computer` pattern, used repeatedly across `vm-building.md` |
+| `hostname.read` | `VmRead` | **Yes** | `[System.Net.Dns]::GetHostName()` — read half of the rename command |
+| `ip.read` | `VmRead` | **Yes** | `Get-NetIPAddress`, non-loopback IPv4 enumeration |
+| `ip.write` | `VmUpdate` | No | Static IPv4 assignment (`Set-NetIPInterface -Dhcp Disabled` + `New-NetIPAddress`), the guide's first-boot pattern |
 | `cert.verify` | `VmRead` | **Yes** | `certutil -verify -urlfetch`, the guide's own health-check command |
 | `powershell.exec_arbitrary` | `VmExecArbitrary` | **No** (by construction) | Reserved escape hatch — must never reach a guest |
+
+`hostname.read`/`ip.read`/`ip.write` are the read-write parity set every
+template machine will eventually need (deployed manually today; per-template
+auto-provisioning is a later phase).
 
 `cert.verify` is deliberately guest-eligible to prove the *allowed* path
 through the registry, not just the forbidden one. `powershell.exec_arbitrary`
@@ -134,7 +141,7 @@ validated:
   `std::process::Command`-based implementation and a mock for tests. Shells
   out rather than binding COM, since every v0 command has a plain PowerShell
   equivalent and this is what's testable from a non-Windows dev machine.
-- `commands/` — the 3 v0 handlers.
+- `commands/` — the command handlers.
 - `phonehome.rs` — the WebSocket client: connects, dispatches inbound
   commands via `spawn_blocking` (dispatch/PowerShell execution are
   synchronous and must not block the async reactor), streams `OpRunState`
@@ -190,7 +197,7 @@ pki-orchestrator.exe service install
 
 `cargo test` runs everything that doesn't require a real Windows box, a live
 shell, or a live backend: config parsing, capability/role gating (including
-the guest ↔ `VmExecArbitrary` invariant), all 3 command handlers driven
+the guest ↔ `VmExecArbitrary` invariant), every command handler driven
 through a mock PowerShell executor, and the phone-home framing/dispatch
 translation (`phonehome::handle_command`) driven through an in-memory
 channel. Real `powershell.exe` invocation, a real WebSocket connection to a
