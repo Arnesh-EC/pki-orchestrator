@@ -30,6 +30,11 @@ pub enum PowerShellError {
         #[source]
         source: std::io::Error
     },
+    #[error("failed to write temp script file: {source}")]
+    TempScript {
+        #[source]
+        source: std::io::Error
+    },
     #[error("script exited with code {exit_code}: {stderr}")]
     NonZeroExit { exit_code: i32, stderr: String }
 }
@@ -65,8 +70,23 @@ impl PowerShellExecutor for RealPowerShell {
         script: &str,
         args: &[String]
     ) -> Result<PowerShellOutput, PowerShellError> {
+        // `-Command <script> <args>` never binds args to the script's
+        // `param()` block: PowerShell joins everything after `-Command` into
+        // one command string, so the args re-parse as extra statements —
+        // params stay empty and untrusted arg text reaches the parser.
+        // `-File` binds them positionally as literal strings, but requires a
+        // real `.ps1` on disk (the extension is mandatory on Windows).
+        let mut file = tempfile::Builder::new()
+            .prefix("pki-orchestrator-")
+            .suffix(".ps1")
+            .tempfile()
+            .map_err(|source| PowerShellError::TempScript { source })?;
+        std::io::Write::write_all(&mut file, script.as_bytes())
+            .map_err(|source| PowerShellError::TempScript { source })?;
+
         let output = Command::new(&self.binary)
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(file.path())
             .args(args)
             .output()
             .map_err(|source| PowerShellError::Spawn {
@@ -170,5 +190,18 @@ mod tests {
         let shell = RealPowerShell::new("powershell.exe");
         let output = shell.run("$PSVersionTable.PSVersion.Major", &[]).unwrap();
         assert!(output.succeeded());
+    }
+
+    // Regression: `-Command` never bound args to `param()` (they re-parsed
+    // as extra statements); `-File` must.
+    #[cfg(windows)]
+    #[test]
+    fn real_powershell_binds_positional_args_to_param() {
+        let shell = RealPowerShell::new("powershell.exe");
+        let output = shell
+            .run("param([string]$X) Write-Output $X", &["bound".to_string()])
+            .unwrap();
+        assert!(output.succeeded());
+        assert_eq!(output.stdout.trim(), "bound");
     }
 }
