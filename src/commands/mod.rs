@@ -2,6 +2,7 @@ mod cert_verify;
 mod exec_arbitrary;
 mod hostname_read;
 mod hostname_rename;
+mod ip;
 
 use crate::registry::CommandRegistry;
 
@@ -16,5 +17,7 @@ pub fn build_default_registry() -> CommandRegistry {
     registry.register(Box::new(hostname_read::HostnameRead));
     registry.register(Box::new(cert_verify::CertVerify));
     registry.register(Box::new(exec_arbitrary::ExecArbitrary));
+    registry.register(Box::new(ip::IpRead));
+    registry.register(Box::new(ip::IpWrite));
     registry
 }

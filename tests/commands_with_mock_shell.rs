@@ -79,6 +79,53 @@ fn guest_can_read_hostname() {
 }
 
 #[test]
+fn guest_can_read_ip() {
+    let registry = build_default_registry();
+    let shell = Arc::new(MockPowerShell::new());
+    shell.push_success(
+        r#"[{"InterfaceAlias":"Ethernet0","IPAddress":"10.0.0.5","PrefixLength":24}]"#
+    );
+    let sink = NullProgressSink;
+    let result = registry
+        .dispatch("ip.read", Role::Guest, HashMap::new(), &sink, shell)
+        .unwrap();
+    assert_eq!(result["addresses"][0]["IPAddress"], "10.0.0.5");
+}
+
+#[test]
+fn guest_cannot_write_ip() {
+    let registry = build_default_registry();
+    let shell = Arc::new(MockPowerShell::new());
+    let sink = NullProgressSink;
+    let result = registry.dispatch(
+        "ip.write",
+        Role::Guest,
+        params(&[("address", "10.0.0.5")]),
+        &sink,
+        shell
+    );
+    assert!(matches!(result, Err(DispatchError::Forbidden { .. })));
+}
+
+#[test]
+fn operator_can_write_ip() {
+    let registry = build_default_registry();
+    let shell = Arc::new(MockPowerShell::new());
+    shell.push_success("");
+    let sink = NullProgressSink;
+    let result = registry
+        .dispatch(
+            "ip.write",
+            Role::Operator,
+            params(&[("address", "10.0.0.5"), ("prefixLength", "16")]),
+            &sink,
+            shell
+        )
+        .unwrap();
+    assert_eq!(result["prefix_length"], "16");
+}
+
+#[test]
 fn guest_cannot_exec_arbitrary_end_to_end() {
     let registry = build_default_registry();
     let shell = Arc::new(MockPowerShell::new());
