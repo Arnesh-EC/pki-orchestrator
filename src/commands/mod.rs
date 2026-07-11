@@ -8,6 +8,7 @@ mod exec_arbitrary;
 mod hostname_read;
 mod hostname_rename;
 mod ip;
+mod system;
 mod template;
 pub(crate) mod util;
 
@@ -32,7 +33,10 @@ pub fn build_default_registry() -> CommandRegistry {
     registry.register(Box::new(ca::CaConfigureCdpAia));
     registry.register(Box::new(ca::CaVerify));
     registry.register(Box::new(dc::DcVerify));
+    registry.register(Box::new(dc::DcInstallForest));
     registry.register(Box::new(domain::DomainVerify));
+    registry.register(Box::new(domain::DomainJoin));
+    registry.register(Box::new(system::SystemReboot));
     registry.register(Box::new(dns::DnsSetClient));
     registry.register(Box::new(dns::DnsCreateRecord));
     registry.register(Box::new(cert_store::CertAddStore));

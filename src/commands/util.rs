@@ -67,6 +67,15 @@ pub fn valid_windows_path(path: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || " ._-\\()".contains(c))
 }
 
+/// A secret param (password) headed for a `param()` block. Content is the
+/// backend's policy to enforce — the only agent-side rule is what keeps
+/// positional `-File` binding safe: a leading '-' would parse as a parameter
+/// name instead of a value. Handlers taking one of these must never echo it
+/// into results, progress phases, or error reasons.
+pub fn valid_secret(value: &str) -> bool {
+    !value.is_empty() && !value.starts_with('-') && value.len() <= 127
+}
+
 /// One DNS name label or dotted name (`pki`, `srv1.example.com.`), max 253
 /// chars — mirrors the backend's `_DNS` validator, plus an optional
 /// trailing dot (FQDN form used by CNAME targets).
