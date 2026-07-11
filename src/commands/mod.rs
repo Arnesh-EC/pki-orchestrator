@@ -55,6 +55,8 @@ pub fn build_default_registry() -> CommandRegistry {
     registry.register(Box::new(template::TemplateGrantAccess));
     registry.register(Box::new(iis::IisSetupCertEnroll));
     registry.register(Box::new(ocsp::OcspInstall));
+    registry.register(Box::new(ocsp::OcspConfigureRevocation));
+    registry.register(Box::new(ocsp::OcspVerify));
     registry.register(Box::new(cert_enroll::CertEnroll));
     registry
 }
