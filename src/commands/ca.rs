@@ -279,6 +279,52 @@ impl CommandHandler for CaConfigureCdpAia {
     }
 }
 
+/// `Get-Service certsvc` + `certutil -ping` — the CA health probe every CA
+/// write step verifies against (Phase L). Reports facts: `ping_ok: false` on
+/// a stopped/pending CA is a successful read — the backend engine's per-step
+/// predicate decides whether to retry.
+pub struct CaVerify;
+
+impl CommandHandler for CaVerify {
+    fn name(&self) -> &'static str {
+        "ca.verify"
+    }
+
+    fn required_capability(&self) -> Capability {
+        Capability::VmRead
+    }
+
+    fn execute(
+        &self,
+        ctx: &CommandContext
+    ) -> Result<serde_json::Value, CommandError> {
+        ctx.progress
+            .report(crate::report::OpRunState::running("pinging CA", 50.0));
+
+        // certutil -ping exits non-zero while the service is stopped; the
+        // script still exits 0 because the ConvertTo-Json at the end succeeds
+        // — pingOk carries the certutil verdict instead.
+        let script = "$svc = Get-Service certsvc -ErrorAction SilentlyContinue; \
+            $service = if ($svc) { $svc.Status.ToString() } else { 'NotInstalled' }; \
+            $ping = (certutil -ping 2>&1) -join \"`n\"; \
+            $pingOk = ($LASTEXITCODE -eq 0); \
+            @{ service = $service; pingOk = $pingOk; ping = $ping } | ConvertTo-Json";
+        let output = crate::commands::util::require_success(
+            ctx.shell.run(script, &[])?
+        )?;
+
+        let probe = crate::commands::util::parse_json(&output.stdout);
+        let result = json!({
+            "service": probe["service"],
+            "ping_ok": probe["pingOk"] == true,
+            "raw": output.stdout
+        });
+        ctx.progress
+            .report(crate::report::OpRunState::done(result.clone()));
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +528,42 @@ mod tests {
             CaConfigureCdpAia.execute(&ctx),
             Err(CommandError::InvalidParam { .. })
         ));
+    }
+
+    #[test]
+    fn verify_reports_running_service_and_live_interface() {
+        let params = HashMap::new();
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success(
+            r#"{"service":"Running","pingOk":true,"ping":"Cert Server \"EC-Root-CA\" is alive"}"#
+        );
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        let result = CaVerify.execute(&ctx).unwrap();
+        assert_eq!(result["service"], "Running");
+        assert_eq!(result["ping_ok"], true);
+    }
+
+    #[test]
+    fn verify_reports_stopped_service_without_erroring() {
+        let params = HashMap::new();
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success(
+            r#"{"service":"Stopped","pingOk":false,"ping":"CertUtil: The service has not been started."}"#
+        );
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        let result = CaVerify.execute(&ctx).unwrap();
+        assert_eq!(result["service"], "Stopped");
+        assert_eq!(result["ping_ok"], false);
     }
 
     #[test]

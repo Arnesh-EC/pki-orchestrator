@@ -1,18 +1,23 @@
 mod ca;
 mod cert_verify;
+mod dc;
+mod dns;
+mod domain;
 mod exec_arbitrary;
 mod hostname_read;
 mod hostname_rename;
 mod ip;
+pub(crate) mod util;
 
 use crate::registry::CommandRegistry;
 
-/// The command surface: the 3 v0 handlers chosen to exercise every point on
-/// the role spectrum (guest-eligible read, operator-only write,
-/// guest-forbidden escape hatch), the hostname/IP read-write parity set every
-/// template machine needs, and (Phase F) the per-template CA provisioning
-/// commands that self-apply from the ISO-baked config. See the README's
-/// command-catalog table for the planned ADCS catalog this grows into.
+/// The command surface: the v0 role-spectrum handlers (guest-eligible read,
+/// operator-only write, guest-forbidden escape hatch), the hostname/IP
+/// read-write parity set, the Phase F CA provisioning commands, and (Phase L)
+/// the growing ADCS lab catalog — verify probes first, so every later write
+/// command lands with its readiness check already dispatchable. The catalog
+/// is mirrored in the backend's `_COMMAND_CAPABILITIES`; both sides assert
+/// against the shared fixture in `tests/fixtures/command_catalog.json`.
 pub fn build_default_registry() -> CommandRegistry {
     let mut registry = CommandRegistry::new();
     registry.register(Box::new(hostname_rename::HostnameRename));
@@ -23,5 +28,9 @@ pub fn build_default_registry() -> CommandRegistry {
     registry.register(Box::new(ip::IpWrite));
     registry.register(Box::new(ca::CaInstall));
     registry.register(Box::new(ca::CaConfigureCdpAia));
+    registry.register(Box::new(ca::CaVerify));
+    registry.register(Box::new(dc::DcVerify));
+    registry.register(Box::new(domain::DomainVerify));
+    registry.register(Box::new(dns::DnsSetClient));
     registry
 }

@@ -77,6 +77,19 @@ impl CommandRegistry {
         self.handlers.is_empty()
     }
 
+    /// Every registered command with its required capability, name-sorted —
+    /// what the command-catalog parity fixture asserts against (see
+    /// `tests/command_catalog.rs` and the backend's `_COMMAND_CAPABILITIES`).
+    pub fn commands(&self) -> Vec<(&'static str, Capability)> {
+        let mut entries: Vec<_> = self
+            .handlers
+            .values()
+            .map(|h| (h.name(), h.required_capability()))
+            .collect();
+        entries.sort_by_key(|(name, _)| *name);
+        entries
+    }
+
     pub fn dispatch(
         &self,
         name: &str,
