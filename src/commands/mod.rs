@@ -1,4 +1,5 @@
 mod ca;
+mod cert_enroll;
 mod cert_store;
 mod cert_verify;
 mod dc;
@@ -8,7 +9,9 @@ mod exec_arbitrary;
 mod file;
 mod hostname_read;
 mod hostname_rename;
+mod iis;
 mod ip;
+mod ocsp;
 mod system;
 mod template;
 pub(crate) mod util;
@@ -50,5 +53,8 @@ pub fn build_default_registry() -> CommandRegistry {
     registry.register(Box::new(cert_store::CertAddStore));
     registry.register(Box::new(cert_store::CertDsPublish));
     registry.register(Box::new(template::TemplateGrantAccess));
+    registry.register(Box::new(iis::IisSetupCertEnroll));
+    registry.register(Box::new(ocsp::OcspInstall));
+    registry.register(Box::new(cert_enroll::CertEnroll));
     registry
 }
