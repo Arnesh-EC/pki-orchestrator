@@ -619,6 +619,189 @@ impl CommandHandler for CaPublishCrl {
     }
 }
 
+/// The root-CA half of the cross-signing handshake (runs on the offline
+/// root): `certreq -submit` the carried CSR, parse the RequestId, issue it
+/// with `certutil -resubmit`, and `certreq -retrieve` the signed cert to a
+/// relay path. The CA config string is resolved locally from the CertSvc
+/// registry — the caller never has to know the root's CA name.
+pub struct CaSignRequest;
+
+impl CommandHandler for CaSignRequest {
+    fn name(&self) -> &'static str {
+        "ca.sign_request"
+    }
+
+    fn required_capability(&self) -> Capability {
+        Capability::VmProvision
+    }
+
+    fn execute(
+        &self,
+        ctx: &CommandContext
+    ) -> Result<serde_json::Value, CommandError> {
+        let csr_path = required(ctx, "csrPath")?;
+        if !valid_windows_path(csr_path) {
+            return Err(invalid("csrPath", "must be an absolute Windows path"));
+        }
+        let cert_path = required(ctx, "certPath")?;
+        if !valid_windows_path(cert_path) {
+            return Err(invalid(
+                "certPath",
+                "must be an absolute Windows path"
+            ));
+        }
+
+        ctx.progress.report(crate::report::OpRunState::running(
+            "signing certificate request",
+            30.0
+        ));
+
+        let script = "param([string]$CsrPath,[string]$CertPath) \
+            $ErrorActionPreference = 'Stop'; \
+            $active = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration').Active; \
+            $config = \"$env:COMPUTERNAME\\$active\"; \
+            $submit = certreq -submit -config $config $CsrPath 2>&1 | Out-String; \
+            if ($submit -notmatch 'RequestId:\\s*(\\d+)') { throw \"certreq -submit did not return a RequestId: $submit\" }; \
+            $requestId = $Matches[1]; \
+            certutil -resubmit $requestId | Out-Null; \
+            if ($LASTEXITCODE -ne 0) { throw \"certutil -resubmit $requestId failed\" }; \
+            New-Item -ItemType Directory -Force -Path (Split-Path $CertPath) | Out-Null; \
+            certreq -retrieve -config $config $requestId $CertPath | Out-Null; \
+            if ($LASTEXITCODE -ne 0) { throw \"certreq -retrieve $requestId failed\" }; \
+            $requestId";
+        let args = [csr_path.to_string(), cert_path.to_string()];
+        let output = require_success(ctx.shell.run(script, &args)?)?;
+
+        let request_id = output.stdout.trim().to_string();
+        if request_id.is_empty()
+            || !request_id.chars().all(|c| c.is_ascii_digit())
+        {
+            return Err(invalid(
+                "csrPath",
+                "signing did not yield a numeric RequestId"
+            ));
+        }
+        let result = json!({
+            "request_id": request_id,
+            "cert_path": cert_path
+        });
+        ctx.progress
+            .report(crate::report::OpRunState::done(result.clone()));
+        Ok(result)
+    }
+}
+
+/// The issuing-CA half of the handshake: `certutil -installcert` the signed
+/// cert carried back from the root, then start certsvc.
+pub struct CaInstallCert;
+
+impl CommandHandler for CaInstallCert {
+    fn name(&self) -> &'static str {
+        "ca.install_cert"
+    }
+
+    fn required_capability(&self) -> Capability {
+        Capability::VmProvision
+    }
+
+    fn execute(
+        &self,
+        ctx: &CommandContext
+    ) -> Result<serde_json::Value, CommandError> {
+        let cert_path = required(ctx, "certPath")?;
+        if !valid_windows_path(cert_path) {
+            return Err(invalid(
+                "certPath",
+                "must be an absolute Windows path"
+            ));
+        }
+
+        ctx.progress.report(crate::report::OpRunState::running(
+            "installing CA certificate",
+            30.0
+        ));
+
+        let script = "param([string]$CertPath) \
+            $ErrorActionPreference = 'Stop'; \
+            certutil -installcert $CertPath | Out-Null; \
+            if ($LASTEXITCODE -ne 0) { throw 'certutil -installcert failed' }; \
+            Start-Service CertSvc; \
+            (Get-Service CertSvc).Status.ToString()";
+        let output =
+            require_success(ctx.shell.run(script, &[cert_path.to_string()])?)?;
+
+        let result = json!({
+            "cert_path": cert_path,
+            "service": output.stdout.trim()
+        });
+        ctx.progress
+            .report(crate::report::OpRunState::done(result.clone()));
+        Ok(result)
+    }
+}
+
+/// `Add-CATemplate` for each named template (CN names, comma-separated) —
+/// the lab publishes `OCSPResponseSigning` and `Workstation`. Idempotent: a
+/// template already on the CA is skipped, so converging plans re-run clean.
+pub struct CaPublishTemplate;
+
+impl CommandHandler for CaPublishTemplate {
+    fn name(&self) -> &'static str {
+        "ca.publish_template"
+    }
+
+    fn required_capability(&self) -> Capability {
+        Capability::VmProvision
+    }
+
+    fn execute(
+        &self,
+        ctx: &CommandContext
+    ) -> Result<serde_json::Value, CommandError> {
+        let raw = required(ctx, "templates")?;
+        let templates: Vec<&str> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        let names_ok = !templates.is_empty()
+            && templates.iter().all(|t| {
+                (1..=64).contains(&t.len())
+                    && t.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+            });
+        if !names_ok {
+            return Err(invalid(
+                "templates",
+                "must be a comma-separated list of template CN names"
+            ));
+        }
+
+        ctx.progress.report(crate::report::OpRunState::running(
+            "publishing templates",
+            30.0
+        ));
+
+        let script = "param([string]$Templates) \
+            $ErrorActionPreference = 'Stop'; \
+            foreach ($t in ($Templates -split ',')) { \
+                try { Add-CATemplate -Name $t.Trim() -Force } \
+                catch { if ($_.Exception.Message -notmatch 'already') { throw } } \
+            }; \
+            (Get-CATemplate | Select-Object -ExpandProperty Name) -join ','";
+        let output =
+            require_success(ctx.shell.run(script, &[templates.join(",")])?)?;
+
+        let result = json!({
+            "templates": templates,
+            "on_ca": output.stdout.trim()
+        });
+        ctx.progress
+            .report(crate::report::OpRunState::done(result.clone()));
+        Ok(result)
+    }
+}
+
 /// `Get-Service certsvc` + `certutil -ping` — the CA health probe every CA
 /// write step verifies against (Phase L). Reports facts: `ping_ok: false` on
 /// a stopped/pending CA is a successful read — the backend engine's per-step
@@ -1099,6 +1282,117 @@ mod tests {
             CaPublishCrl.execute(&ctx),
             Err(CommandError::Shell(_))
         ));
+    }
+
+    #[test]
+    fn sign_request_parses_the_request_id() {
+        let params = ctx_params(&[
+            ("csrPath", "C:\\Transfer\\IssuingCA.req"),
+            ("certPath", "C:\\Transfer\\IssuingCA.crt")
+        ]);
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success("2\n");
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        let result = CaSignRequest.execute(&ctx).unwrap();
+        assert_eq!(result["request_id"], "2");
+        assert_eq!(result["cert_path"], "C:\\Transfer\\IssuingCA.crt");
+    }
+
+    #[test]
+    fn sign_request_rejects_non_numeric_request_id_output() {
+        let params = ctx_params(&[
+            ("csrPath", "C:\\Transfer\\IssuingCA.req"),
+            ("certPath", "C:\\Transfer\\IssuingCA.crt")
+        ]);
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success("unexpected chatter");
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        assert!(matches!(
+            CaSignRequest.execute(&ctx),
+            Err(CommandError::InvalidParam { .. })
+        ));
+    }
+
+    #[test]
+    fn sign_request_propagates_submit_failure() {
+        let params = ctx_params(&[
+            ("csrPath", "C:\\Transfer\\IssuingCA.req"),
+            ("certPath", "C:\\Transfer\\IssuingCA.crt")
+        ]);
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_failure(
+            1,
+            "certreq -submit did not return a RequestId: denied"
+        );
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        assert!(matches!(
+            CaSignRequest.execute(&ctx),
+            Err(CommandError::Shell(_))
+        ));
+    }
+
+    #[test]
+    fn install_cert_reports_service_status() {
+        let params = ctx_params(&[("certPath", "C:\\Transfer\\IssuingCA.crt")]);
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success("Running\n");
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        let result = CaInstallCert.execute(&ctx).unwrap();
+        assert_eq!(result["service"], "Running");
+    }
+
+    #[test]
+    fn publish_template_rejects_injection_shaped_names() {
+        let params =
+            ctx_params(&[("templates", "OCSPResponseSigning,$(evil)")]);
+        let sink = NullProgressSink;
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell: Arc::new(MockPowerShell::new())
+        };
+        assert!(matches!(
+            CaPublishTemplate.execute(&ctx),
+            Err(CommandError::InvalidParam { .. })
+        ));
+    }
+
+    #[test]
+    fn publish_template_reports_the_ca_readback() {
+        let params =
+            ctx_params(&[("templates", "OCSPResponseSigning, Workstation")]);
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success("OCSPResponseSigning,Workstation");
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        let result = CaPublishTemplate.execute(&ctx).unwrap();
+        assert_eq!(result["templates"][0], "OCSPResponseSigning");
+        assert_eq!(result["templates"][1], "Workstation");
+        assert_eq!(result["on_ca"], "OCSPResponseSigning,Workstation");
     }
 
     #[test]
