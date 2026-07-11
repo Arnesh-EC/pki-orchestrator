@@ -1,24 +1,35 @@
-//! ADCS Certificate Authority provisioning commands (Phase F).
+//! ADCS Certificate Authority provisioning commands (Phase F, extended for
+//! the Phase L two-tier lab).
 //!
-//! These are the first per-template *write* commands: they take the CA inputs
-//! a user chose in the console Inspector (algorithm, key length, common name,
-//! validity) and stand up a Standalone Root CA. All inputs arrive as dispatch
-//! params — the backend sends them, both for an operator's ad-hoc dispatch and
-//! for post-phone-home provisioning (where the backend dispatches the command
-//! with the VM's stored template config as params; see the Phase F
-//! backend-driven provisioning model). The agent holds no template state.
+//! `ca.install` stands up either tier: a Standalone Root CA (the offline
+//! root — CAPolicy.inf with renewal + AlternateSignatureAlgorithm=0), or an
+//! Enterprise Subordinate CA (CPS-policy CAPolicy.inf, install runs under
+//! the operator's domain-admin credential via the cmdlet's own `-Credential`
+//! because an Enterprise CA registers itself in AD, and returns the CSR path
+//! for the cross-signing handshake — the expected "installation is
+//! incomplete" warning is allowlisted). The follow-up commands mirror the
+//! lab's post-install passes: `ca.configure_settings` (the `certutil
+//! -setreg` batch + audit policy), `ca.configure_cdp_aia` (full
+//! flag-prefixed AIA/CDP publication arrays) and `ca.publish_crl`.
 //!
-//! Gated on `Capability::VmProvision` (both roles): a guest provisioning *its
-//! own* throwaway CA is the product's point; the backend enforces per-VM
-//! ownership on the dispatch route so it can't target someone else's VM.
+//! All inputs arrive as dispatch params — the backend resolves them from
+//! template config and plan context; the agent holds no template state.
+//! Gated on `Capability::VmProvision` (both roles): a guest provisioning
+//! *its own* throwaway CA is the product's point; the backend enforces
+//! per-VM ownership on the dispatch route.
 //!
 //! Like every handler, all user values reach PowerShell through a `param()`
-//! block + args array, never string-interpolated into the script text.
+//! block + args array, never string-interpolated into the script text; the
+//! domain-admin password is never echoed into results or errors.
 
 use serde_json::json;
 
 use crate::{
     authz::Capability,
+    commands::util::{
+        invalid, param, parse_json, require_success, required, valid_secret,
+        valid_username, valid_windows_path
+    },
     registry::{CommandContext, CommandError, CommandHandler}
 };
 
@@ -26,6 +37,7 @@ const CA_TYPES: &[&str] = &["Root", "Issuing"];
 const KEY_ALGORITHMS: &[&str] = &["RSA", "ECDSA", "ML-DSA-87"];
 const KEY_LENGTHS: &[&str] = &["2048", "4096"];
 const HASH_ALGORITHMS: &[&str] = &["SHA256", "SHA384", "SHA512"];
+const PERIODS: &[&str] = &["Hours", "Days", "Weeks", "Months", "Years"];
 
 /// Post-quantum algorithm identifier as exposed by the Windows Server 2025 CNG
 /// software KSP. UNVERIFIED against a real golden image — the exact provider
@@ -42,23 +54,249 @@ fn cng_provider(algorithm: &str) -> &'static str {
     }
 }
 
-fn invalid(name: &str, reason: &str) -> CommandError {
-    CommandError::InvalidParam {
-        name: name.into(),
-        reason: reason.into()
+fn valid_common_name(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " ._-".contains(c))
+}
+
+/// Shared cryptography params (algorithm / RSA key length / hash), validated
+/// once for both CA tiers.
+struct CryptoParams {
+    algorithm: String,
+    provider: &'static str,
+    key_length: Option<String>,
+    hash_algorithm: Option<String>
+}
+
+fn crypto_params(ctx: &CommandContext) -> Result<CryptoParams, CommandError> {
+    let algorithm = param(ctx, "keyAlgorithm").unwrap_or("RSA");
+    if !KEY_ALGORITHMS.contains(&algorithm) {
+        return Err(invalid(
+            "keyAlgorithm",
+            "must be 'RSA', 'ECDSA' or 'ML-DSA-87'"
+        ));
+    }
+    let is_pqc = algorithm == "ML-DSA-87";
+
+    // Key length applies to RSA only; ECDSA is fixed by the curve and
+    // ML-DSA-87 has a fixed parameter set.
+    let key_length = if algorithm == "RSA" {
+        let kl = param(ctx, "keyLength").unwrap_or("4096");
+        if !KEY_LENGTHS.contains(&kl) {
+            return Err(invalid("keyLength", "must be '2048' or '4096'"));
+        }
+        Some(kl.to_string())
+    } else {
+        None
+    };
+
+    // Hash algorithm is meaningless for ML-DSA-87 (the scheme fixes it).
+    let hash_algorithm = if is_pqc {
+        None
+    } else {
+        let ha = param(ctx, "hashAlgorithm").unwrap_or("SHA256");
+        if !HASH_ALGORITHMS.contains(&ha) {
+            return Err(invalid(
+                "hashAlgorithm",
+                "must be 'SHA256', 'SHA384' or 'SHA512'"
+            ));
+        }
+        Some(ha.to_string())
+    };
+
+    Ok(CryptoParams {
+        algorithm: algorithm.to_string(),
+        provider: cng_provider(algorithm),
+        key_length,
+        hash_algorithm
+    })
+}
+
+/// `Install-AdcsCertificationAuthority` for either lab tier.
+pub struct CaInstall;
+
+impl CaInstall {
+    fn execute_root(
+        &self,
+        ctx: &CommandContext,
+        common_name: &str,
+        crypto: &CryptoParams,
+        validity_years: &str
+    ) -> Result<serde_json::Value, CommandError> {
+        ctx.progress.report(crate::report::OpRunState::running(
+            "installing root CA",
+            20.0
+        ));
+
+        // CAPolicy.inf is built line-by-line (not a here-string) to sidestep
+        // PowerShell's column-zero `"@` rule; single-quoted lines keep the
+        // literal `$Windows NT$` marker from interpolating.
+        let script = "param([string]$CommonName,[string]$Provider,[string]$KeyLength,[string]$HashAlgorithm,[string]$ValidityYears) \
+            $ErrorActionPreference = 'Stop'; \
+            $capolicy = @( \
+                '[Version]', \
+                'Signature=\"$Windows NT$\"', \
+                '', \
+                '[Certsrv_Server]', \
+                'RenewalKeyLength=2048', \
+                'RenewalValidityPeriod=Years', \
+                \"RenewalValidityPeriodUnits=$ValidityYears\", \
+                'AlternateSignatureAlgorithm=0' \
+            ) -join \"`r`n\"; \
+            Set-Content -Path (Join-Path $env:SystemRoot 'CAPolicy.inf') -Value $capolicy -Encoding ASCII; \
+            Install-WindowsFeature ADCS-Cert-Authority -IncludeManagementTools | Out-Null; \
+            Import-Module ADCSDeployment; \
+            $caParams = @{ \
+                CAType = 'StandaloneRootCA'; \
+                CACommonName = $CommonName; \
+                CryptoProviderName = $Provider; \
+                ValidityPeriod = 'Years'; \
+                ValidityPeriodUnits = [int]$ValidityYears; \
+                Force = $true \
+            }; \
+            if ($KeyLength) { $caParams['KeyLength'] = [int]$KeyLength }; \
+            if ($HashAlgorithm) { $caParams['HashAlgorithmName'] = $HashAlgorithm }; \
+            Install-AdcsCertificationAuthority @caParams | Out-Null";
+        let args = [
+            common_name.to_string(),
+            crypto.provider.to_string(),
+            crypto.key_length.clone().unwrap_or_default(),
+            crypto.hash_algorithm.clone().unwrap_or_default(),
+            validity_years.to_string()
+        ];
+        require_success(ctx.shell.run(script, &args)?)?;
+
+        let result = json!({
+            "caType": "StandaloneRootCA",
+            "commonName": common_name,
+            "keyAlgorithm": crypto.algorithm,
+            "keyLength": crypto.key_length,
+            "hashAlgorithm": crypto.hash_algorithm,
+            "validityYears": validity_years
+        });
+        ctx.progress
+            .report(crate::report::OpRunState::done(result.clone()));
+        Ok(result)
+    }
+
+    fn execute_issuing(
+        &self,
+        ctx: &CommandContext,
+        common_name: &str,
+        crypto: &CryptoParams,
+        validity_years: &str
+    ) -> Result<serde_json::Value, CommandError> {
+        // CPS policy statement — optional; both parts validated when present.
+        let cps_url = param(ctx, "cpsUrl").unwrap_or_default();
+        if !(cps_url.is_empty()
+            || cps_url.starts_with("http://")
+            || cps_url.starts_with("https://"))
+        {
+            return Err(invalid("cpsUrl", "must be an http(s) URL"));
+        }
+        let cps_oid = param(ctx, "cpsOid").unwrap_or("1.2.3.4.1455.67.89.5");
+        let oid_ok = cps_oid.split('.').count() >= 2
+            && cps_oid.split('.').all(|part| {
+                !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())
+            });
+        if !oid_ok {
+            return Err(invalid("cpsOid", "must be a dotted-decimal OID"));
+        }
+
+        let csr_path =
+            param(ctx, "csrPath").unwrap_or("C:\\Transfer\\IssuingCA.req");
+        if !valid_windows_path(csr_path) {
+            return Err(invalid("csrPath", "must be an absolute Windows path"));
+        }
+
+        // An Enterprise CA registers itself in AD — LocalSystem on a member
+        // server can't; the install runs under the operator's domain-admin
+        // credential via the cmdlet's own -Credential.
+        let username = required(ctx, "username")?;
+        if !valid_username(username) {
+            return Err(invalid(
+                "username",
+                "must be a plain, domain\\user or user@domain account name"
+            ));
+        }
+        let password = required(ctx, "password")?;
+        if !valid_secret(password) {
+            return Err(invalid(
+                "password",
+                "must be non-empty and not begin with '-'"
+            ));
+        }
+
+        ctx.progress.report(crate::report::OpRunState::running(
+            "installing issuing CA",
+            20.0
+        ));
+
+        // A subordinate install that writes a CSR deliberately finishes "not
+        // started" — Install-AdcsCertificationAuthority surfaces that as an
+        // ErrorString containing "incomplete"; anything else is a real
+        // failure. The CSR path is the script's output.
+        let script = "param([string]$CommonName,[string]$Provider,[string]$KeyLength,[string]$HashAlgorithm,[string]$ValidityYears,[string]$CpsOid,[string]$CpsUrl,[string]$CsrPath,[string]$Username,[string]$Password) \
+            $ErrorActionPreference = 'Stop'; \
+            $lines = @('[Version]', 'Signature=\"$Windows NT$\"'); \
+            if ($CpsUrl) { $lines += @('[PolicyStatementExtension]', 'Policies=InternalPolicy', '[InternalPolicy]', \"OID=$CpsOid\", \"URL=$CpsUrl\") }; \
+            $lines += @( \
+                '[Certsrv_Server]', \
+                'RenewalKeyLength=2048', \
+                'RenewalValidityPeriod=Years', \
+                \"RenewalValidityPeriodUnits=$ValidityYears\", \
+                'LoadDefaultTemplates=0', \
+                'AlternateSignatureAlgorithm=0' \
+            ); \
+            Set-Content -Path (Join-Path $env:SystemRoot 'CAPolicy.inf') -Value ($lines -join \"`r`n\") -Encoding ASCII; \
+            Install-WindowsFeature ADCS-Cert-Authority, ADCS-Web-Enrollment -IncludeManagementTools | Out-Null; \
+            Import-Module ADCSDeployment; \
+            New-Item -ItemType Directory -Force -Path (Split-Path $CsrPath) | Out-Null; \
+            $secure = ConvertTo-SecureString $Password -AsPlainText -Force; \
+            $cred = New-Object System.Management.Automation.PSCredential($Username, $secure); \
+            $caParams = @{ \
+                CAType = 'EnterpriseSubordinateCA'; \
+                CACommonName = $CommonName; \
+                CryptoProviderName = $Provider; \
+                OutputCertRequestFile = $CsrPath; \
+                Credential = $cred; \
+                Force = $true \
+            }; \
+            if ($KeyLength) { $caParams['KeyLength'] = [int]$KeyLength }; \
+            if ($HashAlgorithm) { $caParams['HashAlgorithmName'] = $HashAlgorithm }; \
+            $res = Install-AdcsCertificationAuthority @caParams -WarningAction SilentlyContinue; \
+            if ($res.ErrorString -and $res.ErrorString -notmatch 'incomplete') { throw $res.ErrorString }; \
+            $CsrPath";
+        let args = [
+            common_name.to_string(),
+            crypto.provider.to_string(),
+            crypto.key_length.clone().unwrap_or_default(),
+            crypto.hash_algorithm.clone().unwrap_or_default(),
+            validity_years.to_string(),
+            cps_oid.to_string(),
+            cps_url.to_string(),
+            csr_path.to_string(),
+            username.to_string(),
+            password.to_string()
+        ];
+        require_success(ctx.shell.run(script, &args)?)?;
+
+        let result = json!({
+            "caType": "EnterpriseSubordinateCA",
+            "commonName": common_name,
+            "keyAlgorithm": crypto.algorithm,
+            "keyLength": crypto.key_length,
+            "hashAlgorithm": crypto.hash_algorithm,
+            "csr_path": csr_path,
+            "cpsUrl": if cps_url.is_empty() { serde_json::Value::Null } else { json!(cps_url) }
+        });
+        ctx.progress
+            .report(crate::report::OpRunState::done(result.clone()));
+        Ok(result)
     }
 }
-
-/// Read one dispatch param as `&str`. The backend supplies these — for
-/// self-apply it dispatches the command with the VM's stored template config
-/// as params, so a handler never reads config directly (see the Phase F
-/// backend-driven provisioning model).
-fn param<'a>(ctx: &'a CommandContext, key: &str) -> Option<&'a str> {
-    ctx.params.get(key).map(String::as_str)
-}
-
-/// `Install-AdcsCertificationAuthority` for a Standalone Root CA.
-pub struct CaInstall;
 
 impl CommandHandler for CaInstall {
     fn name(&self) -> &'static str {
@@ -77,64 +315,23 @@ impl CommandHandler for CaInstall {
         if !CA_TYPES.contains(&ca_type) {
             return Err(invalid("caType", "must be 'Root' or 'Issuing'"));
         }
-        if ca_type == "Issuing" {
-            // Issuing CAs need an enrolled subordinate cert from a parent CA —
-            // a multi-VM flow the plan runner doesn't orchestrate yet.
-            return Err(invalid(
-                "caType",
-                "Issuing CA install is not yet supported (Root only in this phase)"
-            ));
-        }
 
-        let common_name = param(ctx, "commonName")
-            .ok_or_else(|| CommandError::MissingParam("commonName".into()))?;
-        let cn_ok = (1..=64).contains(&common_name.len())
-            && common_name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || " ._-".contains(c));
-        if !cn_ok {
+        let common_name = required(ctx, "commonName")?;
+        if !valid_common_name(common_name) {
             return Err(invalid(
                 "commonName",
                 "must be 1-64 chars of [A-Za-z0-9 ._-]"
             ));
         }
 
-        let algorithm = param(ctx, "keyAlgorithm").unwrap_or("RSA");
-        if !KEY_ALGORITHMS.contains(&algorithm) {
-            return Err(invalid(
-                "keyAlgorithm",
-                "must be 'RSA', 'ECDSA' or 'ML-DSA-87'"
-            ));
-        }
-        let is_pqc = algorithm == "ML-DSA-87";
+        let crypto = crypto_params(ctx)?;
 
-        // Key length applies to RSA only; ECDSA is fixed by the curve and
-        // ML-DSA-87 has a fixed parameter set.
-        let key_length = if algorithm == "RSA" {
-            let kl = param(ctx, "keyLength").unwrap_or("4096");
-            if !KEY_LENGTHS.contains(&kl) {
-                return Err(invalid("keyLength", "must be '2048' or '4096'"));
-            }
-            Some(kl)
-        } else {
-            None
-        };
-
-        // Hash algorithm is meaningless for ML-DSA-87 (the scheme fixes it).
-        let hash_algorithm = if is_pqc {
-            None
-        } else {
-            let ha = param(ctx, "hashAlgorithm").unwrap_or("SHA256");
-            if !HASH_ALGORITHMS.contains(&ha) {
-                return Err(invalid(
-                    "hashAlgorithm",
-                    "must be 'SHA256', 'SHA384' or 'SHA512'"
-                ));
-            }
-            Some(ha)
-        };
-
-        let validity_years = param(ctx, "validityYears").unwrap_or("5");
+        // Root: the CA cert's own lifetime AND the CAPolicy renewal window.
+        // Issuing: the CAPolicy renewal window only (the cert's lifetime is
+        // set by the root's ValidityPeriodUnits at signing time).
+        let default_years = if ca_type == "Root" { "20" } else { "10" };
+        let validity_years =
+            param(ctx, "validityYears").unwrap_or(default_years);
         match validity_years.parse::<u32>() {
             Ok(y) if (1..=50).contains(&y) => {}
             _ => {
@@ -145,76 +342,177 @@ impl CommandHandler for CaInstall {
             }
         }
 
-        let provider = cng_provider(algorithm);
+        if ca_type == "Issuing" {
+            self.execute_issuing(ctx, common_name, &crypto, validity_years)
+        } else {
+            self.execute_root(ctx, common_name, &crypto, validity_years)
+        }
+    }
+}
 
-        ctx.progress
-            .report(crate::report::OpRunState::running("installing CA", 20.0));
+/// The lab's post-install `certutil -setreg` batch: DSConfigDN, CRL/delta/
+/// overlap periods, issued-cert validity, and the audit filter (which also
+/// enables Object Access auditing). Applies exactly the params present, then
+/// restarts certsvc.
+pub struct CaConfigureSettings;
 
-        // CAPolicy.inf is built line-by-line (not a here-string) to sidestep
-        // PowerShell's column-zero `"@` rule; single-quoted lines keep the
-        // literal `$Windows NT$` marker from interpolating.
-        let script = "param([string]$CommonName,[string]$Provider,[string]$KeyLength,[string]$HashAlgorithm,[string]$ValidityYears) \
-            $ErrorActionPreference = 'Stop'; \
-            $capolicy = @( \
-                '[Version]', \
-                'Signature=\"$Windows NT$\"', \
-                '', \
-                '[Certsrv_Server]', \
-                'RenewalValidityPeriod=Years', \
-                \"RenewalValidityPeriodUnits=$ValidityYears\" \
-            ) -join \"`r`n\"; \
-            Set-Content -Path (Join-Path $env:SystemRoot 'CAPolicy.inf') -Value $capolicy -Encoding ASCII; \
-            Import-Module ADCSDeployment; \
-            $caParams = @{ \
-                CAType = 'StandaloneRootCA'; \
-                CACommonName = $CommonName; \
-                CryptoProviderName = $Provider; \
-                ValidityPeriod = 'Years'; \
-                ValidityPeriodUnits = [int]$ValidityYears; \
-                Force = $true \
-            }; \
-            if ($KeyLength) { $caParams['KeyLength'] = [int]$KeyLength }; \
-            if ($HashAlgorithm) { $caParams['HashAlgorithmName'] = $HashAlgorithm }; \
-            Install-AdcsCertificationAuthority @caParams";
-        let args = [
-            common_name.to_string(),
-            provider.to_string(),
-            key_length.unwrap_or("").to_string(),
-            hash_algorithm.unwrap_or("").to_string(),
-            validity_years.to_string()
-        ];
-        let output = ctx.shell.run(script, &args)?;
-        if !output.succeeded() {
-            return Err(CommandError::Shell(
-                crate::powershell::PowerShellError::NonZeroExit {
-                    exit_code: output.exit_code,
-                    stderr: output.stderr
+impl CommandHandler for CaConfigureSettings {
+    fn name(&self) -> &'static str {
+        "ca.configure_settings"
+    }
+
+    fn required_capability(&self) -> Capability {
+        Capability::VmProvision
+    }
+
+    fn execute(
+        &self,
+        ctx: &CommandContext
+    ) -> Result<serde_json::Value, CommandError> {
+        let ds_config_dn = param(ctx, "dsConfigDn").unwrap_or_default();
+        if !ds_config_dn.is_empty() {
+            let dn_ok = ds_config_dn.starts_with("CN=Configuration,DC=")
+                && ds_config_dn.len() <= 200
+                && ds_config_dn
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "=,.-".contains(c));
+            if !dn_ok {
+                return Err(invalid(
+                    "dsConfigDn",
+                    "must be a CN=Configuration,DC=... distinguished name"
+                ));
+            }
+        }
+
+        let mut applied = serde_json::Map::new();
+        if !ds_config_dn.is_empty() {
+            applied.insert("dsConfigDn".into(), json!(ds_config_dn));
+        }
+
+        let mut unit_of = |key: &str,
+                           max: u32|
+         -> Result<String, CommandError> {
+            let value = param(ctx, key).unwrap_or_default();
+            if !value.is_empty() {
+                match value.parse::<u32>() {
+                    Ok(v) if v <= max => {
+                        applied.insert(key.into(), json!(value));
+                    }
+                    _ => {
+                        return Err(CommandError::InvalidParam {
+                            name: key.into(),
+                            reason: format!("must be an integer in 0-{max}")
+                        });
+                    }
                 }
+            }
+            Ok(value.to_string())
+        };
+        let crl_units = unit_of("crlPeriodUnits", 9999)?;
+        let delta_units = unit_of("crlDeltaPeriodUnits", 9999)?;
+        let overlap_units = unit_of("crlOverlapUnits", 9999)?;
+        let validity_units = unit_of("validityPeriodUnits", 9999)?;
+        let audit_filter = unit_of("auditFilter", 127)?;
+
+        let mut period_of = |key: &str| -> Result<String, CommandError> {
+            let value = param(ctx, key).unwrap_or_default();
+            if !value.is_empty() {
+                if !PERIODS.contains(&value) {
+                    return Err(CommandError::InvalidParam {
+                        name: key.into(),
+                        reason:
+                            "must be 'Hours', 'Days', 'Weeks', 'Months' or 'Years'"
+                                .into()
+                    });
+                }
+                applied.insert(key.into(), json!(value));
+            }
+            Ok(value.to_string())
+        };
+        let crl_period = period_of("crlPeriod")?;
+        let delta_period = period_of("crlDeltaPeriod")?;
+        let overlap_period = period_of("crlOverlapPeriod")?;
+        let validity_period = period_of("validityPeriod")?;
+
+        if applied.is_empty() {
+            return Err(CommandError::MissingParam(
+                "at least one CA setting".into()
             ));
         }
 
-        let result = json!({
-            "caType": "StandaloneRootCA",
-            "commonName": common_name,
-            "keyAlgorithm": algorithm,
-            "keyLength": key_length,
-            "hashAlgorithm": hash_algorithm,
-            "validityYears": validity_years
-        });
+        ctx.progress.report(crate::report::OpRunState::running(
+            "applying CA settings",
+            30.0
+        ));
+
+        let script = "param([string]$DsConfigDn,[string]$CrlPeriodUnits,[string]$CrlPeriod,[string]$CrlDeltaPeriodUnits,[string]$CrlDeltaPeriod,[string]$CrlOverlapUnits,[string]$CrlOverlapPeriod,[string]$ValidityPeriodUnits,[string]$ValidityPeriod,[string]$AuditFilter) \
+            $ErrorActionPreference = 'Stop'; \
+            function Set-CaReg([string]$Key,[string]$Value) { certutil -setreg $Key $Value | Out-Null; if ($LASTEXITCODE -ne 0) { throw \"certutil -setreg $Key failed\" } }; \
+            if ($DsConfigDn) { Set-CaReg 'CA\\DSConfigDN' $DsConfigDn }; \
+            if ($CrlPeriodUnits) { Set-CaReg 'CA\\CRLPeriodUnits' $CrlPeriodUnits }; \
+            if ($CrlPeriod) { Set-CaReg 'CA\\CRLPeriod' $CrlPeriod }; \
+            if ($CrlDeltaPeriodUnits) { Set-CaReg 'CA\\CRLDeltaPeriodUnits' $CrlDeltaPeriodUnits }; \
+            if ($CrlDeltaPeriod) { Set-CaReg 'CA\\CRLDeltaPeriod' $CrlDeltaPeriod }; \
+            if ($CrlOverlapUnits) { Set-CaReg 'CA\\CRLOverlapPeriodUnits' $CrlOverlapUnits }; \
+            if ($CrlOverlapPeriod) { Set-CaReg 'CA\\CRLOverlapPeriod' $CrlOverlapPeriod }; \
+            if ($ValidityPeriodUnits) { Set-CaReg 'CA\\ValidityPeriodUnits' $ValidityPeriodUnits }; \
+            if ($ValidityPeriod) { Set-CaReg 'CA\\ValidityPeriod' $ValidityPeriod }; \
+            if ($AuditFilter) { \
+                Set-CaReg 'CA\\AuditFilter' $AuditFilter; \
+                auditpol /set /category:'Object Access' /success:enable /failure:enable | Out-Null \
+            }; \
+            Restart-Service certsvc";
+        let args = [
+            ds_config_dn.to_string(),
+            crl_units,
+            crl_period,
+            delta_units,
+            delta_period,
+            overlap_units,
+            overlap_period,
+            validity_units,
+            validity_period,
+            audit_filter
+        ];
+        require_success(ctx.shell.run(script, &args)?)?;
+
+        let result = json!({ "applied": applied });
         ctx.progress
             .report(crate::report::OpRunState::done(result.clone()));
         Ok(result)
     }
 }
 
-fn valid_publication_url(url: &str) -> bool {
-    ["http://", "https://", "ldap://", "file://"]
-        .iter()
-        .any(|scheme| url.starts_with(scheme))
+/// One flag-prefixed publication entry (`"2:http://pki.../%3%8%9.crl"`).
+/// The %-token substitution is certutil's, so tokens pass through verbatim;
+/// only the URL scheme/anchor and a conservative character set are checked.
+fn valid_publication_entry(entry: &str) -> bool {
+    let Some((flags, location)) = entry.split_once(':') else {
+        return false;
+    };
+    let flags_ok = !flags.is_empty()
+        && flags.chars().all(|c| c.is_ascii_digit())
+        && flags.parse::<u32>().is_ok_and(|f| f <= 1023);
+    if !flags_ok || location.is_empty() || location.len() > 300 {
+        return false;
+    }
+    let anchored = location.starts_with("ldap:///")
+        || location.starts_with("http://")
+        || location.starts_with("https://")
+        || location.starts_with("file://")
+        || location.starts_with("\\\\")
+        || (location.len() > 3
+            && location.as_bytes()[1] == b':'
+            && location.as_bytes()[2] == b'\\'
+            && location.chars().next().unwrap().is_ascii_alphabetic());
+    anchored && !location.chars().any(|c| "\"'`;$\n\r".contains(c))
 }
 
-/// Point the CA's CRL (CDP) and issuer-cert (AIA) publication URLs at
-/// caller-supplied locations, then restart `certsvc` to apply.
+/// Replace the CA's full AIA (`CACertPublicationURLs`) and CDP
+/// (`CRLPublicationURLs`) arrays with caller-supplied flag-prefixed entries
+/// (newline-separated in the params), purge the machine Kerberos tickets,
+/// and restart certsvc. `-setreg` overwrites the whole array — safe to
+/// re-run.
 pub struct CaConfigureCdpAia;
 
 impl CommandHandler for CaConfigureCdpAia {
@@ -230,22 +528,33 @@ impl CommandHandler for CaConfigureCdpAia {
         &self,
         ctx: &CommandContext
     ) -> Result<serde_json::Value, CommandError> {
-        let cdp_url = param(ctx, "cdpUrl").unwrap_or_default();
-        let aia_url = param(ctx, "aiaUrl").unwrap_or_default();
-        if cdp_url.is_empty() && aia_url.is_empty() {
-            return Err(CommandError::MissingParam("cdpUrl or aiaUrl".into()));
-        }
-        if !cdp_url.is_empty() && !valid_publication_url(cdp_url) {
-            return Err(invalid(
-                "cdpUrl",
-                "must start with http://, https://, ldap:// or file://"
+        let split = |raw: &str| -> Vec<String> {
+            raw.split('\n')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let aia_entries = split(param(ctx, "aiaUrls").unwrap_or_default());
+        let cdp_entries = split(param(ctx, "cdpUrls").unwrap_or_default());
+        if aia_entries.is_empty() && cdp_entries.is_empty() {
+            return Err(CommandError::MissingParam(
+                "aiaUrls or cdpUrls".into()
             ));
         }
-        if !aia_url.is_empty() && !valid_publication_url(aia_url) {
-            return Err(invalid(
-                "aiaUrl",
-                "must start with http://, https://, ldap:// or file://"
-            ));
+        for (name, entries) in
+            [("aiaUrls", &aia_entries), ("cdpUrls", &cdp_entries)]
+        {
+            if let Some(bad) =
+                entries.iter().find(|e| !valid_publication_entry(e))
+            {
+                return Err(CommandError::InvalidParam {
+                    name: name.into(),
+                    reason: format!(
+                        "entry '{bad}' is not a flag-prefixed publication URL"
+                    )
+                });
+            }
         }
 
         ctx.progress.report(crate::report::OpRunState::running(
@@ -253,26 +562,57 @@ impl CommandHandler for CaConfigureCdpAia {
             40.0
         ));
 
-        let script = "param([string]$CdpUrl,[string]$AiaUrl) \
+        // certutil's multi-entry syntax wants the entries joined by a
+        // LITERAL backslash-n inside one argument (as in the lab guide's
+        // quoted strings) — not real newlines.
+        let aia_joined = aia_entries.join("\\n");
+        let cdp_joined = cdp_entries.join("\\n");
+
+        // klist purge drops the machine account's cached Kerberos tickets
+        // (logon id 0x3e7 = SYSTEM) so LDAP publishing sees fresh group
+        // membership; best-effort, certutil failures are the hard gate.
+        let script = "param([string]$AiaUrls,[string]$CdpUrls) \
             $ErrorActionPreference = 'Stop'; \
-            if ($CdpUrl) { certutil -setreg CA\\CRLPublicationURLs (\"65:C:\\Windows\\System32\\CertSrv\\CertEnroll\\%3%8%9.crl`n6:\" + $CdpUrl) }; \
-            if ($AiaUrl) { certutil -setreg CA\\CACertPublicationURLs (\"1:C:\\Windows\\System32\\CertSrv\\CertEnroll\\%1_%3%4.crt`n2:\" + $AiaUrl) }; \
+            if ($AiaUrls) { certutil -setreg CA\\CACertPublicationURLs $AiaUrls | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'certutil -setreg CACertPublicationURLs failed' } }; \
+            if ($CdpUrls) { certutil -setreg CA\\CRLPublicationURLs $CdpUrls | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'certutil -setreg CRLPublicationURLs failed' } }; \
+            klist -li 0x3e7 purge | Out-Null; \
             Restart-Service certsvc";
-        let args = [cdp_url.to_string(), aia_url.to_string()];
-        let output = ctx.shell.run(script, &args)?;
-        if !output.succeeded() {
-            return Err(CommandError::Shell(
-                crate::powershell::PowerShellError::NonZeroExit {
-                    exit_code: output.exit_code,
-                    stderr: output.stderr
-                }
-            ));
-        }
+        let args = [aia_joined, cdp_joined];
+        require_success(ctx.shell.run(script, &args)?)?;
 
         let result = json!({
-            "cdpUrl": if cdp_url.is_empty() { serde_json::Value::Null } else { json!(cdp_url) },
-            "aiaUrl": if aia_url.is_empty() { serde_json::Value::Null } else { json!(aia_url) }
+            "aia_urls": aia_entries,
+            "cdp_urls": cdp_entries
         });
+        ctx.progress
+            .report(crate::report::OpRunState::done(result.clone()));
+        Ok(result)
+    }
+}
+
+/// `certutil -crl` — publish a fresh CRL (and delta, where configured).
+pub struct CaPublishCrl;
+
+impl CommandHandler for CaPublishCrl {
+    fn name(&self) -> &'static str {
+        "ca.publish_crl"
+    }
+
+    fn required_capability(&self) -> Capability {
+        Capability::VmProvision
+    }
+
+    fn execute(
+        &self,
+        ctx: &CommandContext
+    ) -> Result<serde_json::Value, CommandError> {
+        ctx.progress
+            .report(crate::report::OpRunState::running("publishing CRL", 50.0));
+
+        let script = "certutil -crl; exit $LASTEXITCODE";
+        let output = require_success(ctx.shell.run(script, &[])?)?;
+
+        let result = json!({ "published": true, "raw": output.stdout });
         ctx.progress
             .report(crate::report::OpRunState::done(result.clone()));
         Ok(result)
@@ -309,11 +649,9 @@ impl CommandHandler for CaVerify {
             $ping = (certutil -ping 2>&1) -join \"`n\"; \
             $pingOk = ($LASTEXITCODE -eq 0); \
             @{ service = $service; pingOk = $pingOk; ping = $ping } | ConvertTo-Json";
-        let output = crate::commands::util::require_success(
-            ctx.shell.run(script, &[])?
-        )?;
+        let output = require_success(ctx.shell.run(script, &[])?)?;
 
-        let probe = crate::commands::util::parse_json(&output.stdout);
+        let probe = parse_json(&output.stdout);
         let result = json!({
             "service": probe["service"],
             "ping_ok": probe["pingOk"] == true,
@@ -336,21 +674,6 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
-    }
-
-    #[test]
-    fn install_rejects_issuing_ca() {
-        let params = ctx_params(&[("caType", "Issuing"), ("commonName", "X")]);
-        let sink = NullProgressSink;
-        let ctx = CommandContext {
-            params: &params,
-            progress: &sink,
-            shell: Arc::new(MockPowerShell::new())
-        };
-        assert!(matches!(
-            CaInstall.execute(&ctx),
-            Err(CommandError::InvalidParam { .. })
-        ));
     }
 
     #[test]
@@ -500,8 +823,177 @@ mod tests {
         assert!(result["keyLength"].is_null());
     }
 
+    fn issuing_params() -> HashMap<String, String> {
+        ctx_params(&[
+            ("caType", "Issuing"),
+            ("commonName", "EncryptionConsulting Issuing CA"),
+            ("cpsUrl", "http://pki.EncryptionConsulting.com/cps.txt"),
+            ("csrPath", "C:\\Transfer\\IssuingCA.req"),
+            ("username", "ENCRYPTIONCONSU\\Administrator"),
+            ("password", "Sup3r-Secret-Pw!")
+        ])
+    }
+
     #[test]
-    fn configure_requires_at_least_one_url() {
+    fn install_issuing_requires_credentials() {
+        let mut params = issuing_params();
+        params.remove("password");
+        let sink = NullProgressSink;
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell: Arc::new(MockPowerShell::new())
+        };
+        assert!(matches!(
+            CaInstall.execute(&ctx),
+            Err(CommandError::MissingParam(_))
+        ));
+    }
+
+    #[test]
+    fn install_issuing_reports_csr_path() {
+        let params = issuing_params();
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success("C:\\Transfer\\IssuingCA.req\n");
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        let result = CaInstall.execute(&ctx).unwrap();
+        assert_eq!(result["caType"], "EnterpriseSubordinateCA");
+        assert_eq!(result["csr_path"], "C:\\Transfer\\IssuingCA.req");
+    }
+
+    #[test]
+    fn install_issuing_never_leaks_the_password() {
+        let params = issuing_params();
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success("");
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell: Arc::clone(&shell) as _
+        };
+        let result = CaInstall.execute(&ctx).unwrap();
+        assert!(!result.to_string().contains("Sup3r-Secret-Pw!"));
+        for script in shell.calls.lock().unwrap().iter() {
+            assert!(!script.contains("Sup3r-Secret-Pw!"));
+        }
+    }
+
+    #[test]
+    fn install_issuing_rejects_bad_cps_url() {
+        let mut params = issuing_params();
+        params.insert("cpsUrl".into(), "javascript:alert(1)".into());
+        let sink = NullProgressSink;
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell: Arc::new(MockPowerShell::new())
+        };
+        assert!(matches!(
+            CaInstall.execute(&ctx),
+            Err(CommandError::InvalidParam { .. })
+        ));
+    }
+
+    #[test]
+    fn install_issuing_rejects_bad_cps_oid() {
+        let mut params = issuing_params();
+        params.insert("cpsOid".into(), "not-an-oid".into());
+        let sink = NullProgressSink;
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell: Arc::new(MockPowerShell::new())
+        };
+        assert!(matches!(
+            CaInstall.execute(&ctx),
+            Err(CommandError::InvalidParam { .. })
+        ));
+    }
+
+    #[test]
+    fn configure_settings_requires_at_least_one_setting() {
+        let params = HashMap::new();
+        let sink = NullProgressSink;
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell: Arc::new(MockPowerShell::new())
+        };
+        assert!(matches!(
+            CaConfigureSettings.execute(&ctx),
+            Err(CommandError::MissingParam(_))
+        ));
+    }
+
+    #[test]
+    fn configure_settings_rejects_bad_period() {
+        let params = ctx_params(&[
+            ("crlPeriodUnits", "52"),
+            ("crlPeriod", "Fortnights")
+        ]);
+        let sink = NullProgressSink;
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell: Arc::new(MockPowerShell::new())
+        };
+        assert!(matches!(
+            CaConfigureSettings.execute(&ctx),
+            Err(CommandError::InvalidParam { .. })
+        ));
+    }
+
+    #[test]
+    fn configure_settings_rejects_bad_ds_config_dn() {
+        let params =
+            ctx_params(&[("dsConfigDn", "CN=Configuration'; drop --")]);
+        let sink = NullProgressSink;
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell: Arc::new(MockPowerShell::new())
+        };
+        assert!(matches!(
+            CaConfigureSettings.execute(&ctx),
+            Err(CommandError::InvalidParam { .. })
+        ));
+    }
+
+    #[test]
+    fn configure_settings_echoes_applied_subset() {
+        let params = ctx_params(&[
+            (
+                "dsConfigDn",
+                "CN=Configuration,DC=EncryptionConsulting,DC=com"
+            ),
+            ("crlPeriodUnits", "52"),
+            ("crlPeriod", "Weeks"),
+            ("crlDeltaPeriodUnits", "0"),
+            ("auditFilter", "127")
+        ]);
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success("");
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        let result = CaConfigureSettings.execute(&ctx).unwrap();
+        assert_eq!(result["applied"]["crlPeriodUnits"], "52");
+        assert_eq!(result["applied"]["crlDeltaPeriodUnits"], "0");
+        assert_eq!(result["applied"]["auditFilter"], "127");
+        assert!(result["applied"]["validityPeriodUnits"].is_null());
+    }
+
+    #[test]
+    fn configure_cdp_aia_requires_at_least_one_array() {
         let params = HashMap::new();
         let sink = NullProgressSink;
         let ctx = CommandContext {
@@ -516,8 +1008,8 @@ mod tests {
     }
 
     #[test]
-    fn configure_rejects_bad_url_scheme() {
-        let params = ctx_params(&[("cdpUrl", "javascript:alert(1)")]);
+    fn configure_cdp_aia_rejects_unprefixed_entry() {
+        let params = ctx_params(&[("cdpUrls", "http://pki.example/root.crl")]);
         let sink = NullProgressSink;
         let ctx = CommandContext {
             params: &params,
@@ -527,6 +1019,85 @@ mod tests {
         assert!(matches!(
             CaConfigureCdpAia.execute(&ctx),
             Err(CommandError::InvalidParam { .. })
+        ));
+    }
+
+    #[test]
+    fn configure_cdp_aia_rejects_injection_shaped_entry() {
+        let params =
+            ctx_params(&[("cdpUrls", "2:http://pki.example/x.crl'; rm")]);
+        let sink = NullProgressSink;
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell: Arc::new(MockPowerShell::new())
+        };
+        assert!(matches!(
+            CaConfigureCdpAia.execute(&ctx),
+            Err(CommandError::InvalidParam { .. })
+        ));
+    }
+
+    #[test]
+    fn configure_cdp_aia_accepts_the_labs_full_issuing_arrays() {
+        let params = ctx_params(&[
+            (
+                "aiaUrls",
+                "1:C:\\Windows\\system32\\CertSrv\\CertEnroll\\%1_%3%4.crt\n\
+                 2:ldap:///CN=%7,CN=AIA,CN=Public Key Services,CN=Services,%6%11\n\
+                 2:http://pki.EncryptionConsulting.com/CertEnroll/%1_%3%4.crt\n\
+                 32:http://srv1.EncryptionConsulting.com/ocsp"
+            ),
+            (
+                "cdpUrls",
+                "65:C:\\Windows\\system32\\CertSrv\\CertEnroll\\%3%8%9.crl\n\
+                 79:ldap:///CN=%7%8,CN=%2,CN=CDP,CN=Public Key Services,CN=Services,%6%10\n\
+                 6:http://pki.EncryptionConsulting.com/CertEnroll/%3%8%9.crl\n\
+                 65:\\\\srv1.EncryptionConsulting.com\\CertEnroll\\%3%8%9.crl"
+            )
+        ]);
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success("");
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        let result = CaConfigureCdpAia.execute(&ctx).unwrap();
+        assert_eq!(result["aia_urls"].as_array().unwrap().len(), 4);
+        assert_eq!(result["cdp_urls"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn publish_crl_reports_published() {
+        let params = HashMap::new();
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success("CertUtil: -CRL command completed successfully.");
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        let result = CaPublishCrl.execute(&ctx).unwrap();
+        assert_eq!(result["published"], true);
+    }
+
+    #[test]
+    fn publish_crl_propagates_failure() {
+        let params = HashMap::new();
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_failure(1, "CertUtil: The service has not been started.");
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell
+        };
+        assert!(matches!(
+            CaPublishCrl.execute(&ctx),
+            Err(CommandError::Shell(_))
         ));
     }
 
@@ -564,21 +1135,5 @@ mod tests {
         let result = CaVerify.execute(&ctx).unwrap();
         assert_eq!(result["service"], "Stopped");
         assert_eq!(result["ping_ok"], false);
-    }
-
-    #[test]
-    fn configure_succeeds_with_http_cdp() {
-        let params = ctx_params(&[("cdpUrl", "http://pki.example/root.crl")]);
-        let sink = NullProgressSink;
-        let shell = Arc::new(MockPowerShell::new());
-        shell.push_success("");
-        let ctx = CommandContext {
-            params: &params,
-            progress: &sink,
-            shell
-        };
-        let result = CaConfigureCdpAia.execute(&ctx).unwrap();
-        assert_eq!(result["cdpUrl"], "http://pki.example/root.crl");
-        assert!(result["aiaUrl"].is_null());
     }
 }

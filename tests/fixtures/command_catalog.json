@@ -1,6 +1,8 @@
 {
   "ca.configure_cdp_aia": "vm:provision",
+  "ca.configure_settings": "vm:provision",
   "ca.install": "vm:provision",
+  "ca.publish_crl": "vm:provision",
   "ca.verify": "vm:read",
   "cert.addstore": "vm:provision",
   "cert.dspublish": "vm:provision",

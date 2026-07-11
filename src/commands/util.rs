@@ -76,6 +76,16 @@ pub fn valid_secret(value: &str) -> bool {
     !value.is_empty() && !value.starts_with('-') && value.len() <= 127
 }
 
+/// A Windows account name — plain (`Administrator`), down-level
+/// (`DOMAIN\user`) or UPN (`user@domain`) form.
+pub fn valid_username(value: &str) -> bool {
+    (1..=104).contains(&value.len())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "\\@.-_".contains(c))
+        && !value.starts_with('-')
+}
+
 /// One DNS name label or dotted name (`pki`, `srv1.example.com.`), max 253
 /// chars — mirrors the backend's `_DNS` validator, plus an optional
 /// trailing dot (FQDN form used by CNAME targets).

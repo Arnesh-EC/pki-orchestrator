@@ -13,18 +13,10 @@ use crate::{
     authz::Capability,
     commands::util::{
         invalid, parse_json, require_success, required, valid_dns_name,
-        valid_secret
+        valid_secret, valid_username
     },
     registry::{CommandContext, CommandError, CommandHandler}
 };
-
-fn valid_username(value: &str) -> bool {
-    (1..=104).contains(&value.len())
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "\\@.-_".contains(c))
-        && !value.starts_with('-')
-}
 
 /// `Add-Computer -DomainName -Credential` (no `-Restart`). The domain-admin
 /// credential arrives as secret params and is never echoed back.

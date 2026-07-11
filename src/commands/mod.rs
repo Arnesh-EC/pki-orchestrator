@@ -30,7 +30,9 @@ pub fn build_default_registry() -> CommandRegistry {
     registry.register(Box::new(ip::IpRead));
     registry.register(Box::new(ip::IpWrite));
     registry.register(Box::new(ca::CaInstall));
+    registry.register(Box::new(ca::CaConfigureSettings));
     registry.register(Box::new(ca::CaConfigureCdpAia));
+    registry.register(Box::new(ca::CaPublishCrl));
     registry.register(Box::new(ca::CaVerify));
     registry.register(Box::new(dc::DcVerify));
     registry.register(Box::new(dc::DcInstallForest));
