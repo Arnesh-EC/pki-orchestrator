@@ -84,8 +84,19 @@ impl PowerShellExecutor for RealPowerShell {
         std::io::Write::write_all(&mut file, script.as_bytes())
             .map_err(|source| PowerShellError::TempScript { source })?;
 
+        // `-ExecutionPolicy Bypass` is required for `-File`: an unsigned
+        // `.ps1` on disk is blocked under the default machine policy
+        // (Restricted/RemoteSigned), which silently fails the script and is
+        // exactly what broke this on Windows CI. `-Command` isn't subject to
+        // the file-based policy, hence why the mock path never saw it.
         let output = Command::new(&self.binary)
-            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
             .arg(file.path())
             .args(args)
             .output()
