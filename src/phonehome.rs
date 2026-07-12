@@ -18,8 +18,10 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::{
     Message, client::IntoClientRequest, handshake::client::Request,
     http::HeaderValue,
@@ -134,15 +136,46 @@ fn connect_request(config: &OrchestratorConfig) -> Result<Request> {
     Ok(request)
 }
 
+/// Build the WebSocket TLS connector with an **explicit** `ring` crypto
+/// provider.
+///
+/// `tokio_tungstenite::connect_async` builds its `ClientConfig` through the
+/// argument-less `ClientConfig::builder()`, which resolves the crypto provider
+/// from a process-global default or from unambiguous crate features. In the
+/// release Windows build neither path held — rustls's feature auto-detection
+/// yielded no provider and a `CryptoProvider::install_default()` in `main` was
+/// not observed at the connect site — so the first handshake panicked
+/// ("Could not automatically determine the process-level CryptoProvider").
+/// Passing the provider explicitly via `builder_with_provider` sidesteps that
+/// resolution entirely, so the connection is immune to however rustls's
+/// features happen to unify in a given build.
+fn tls_connector() -> Result<Connector> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("configuring TLS protocol versions")?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(Connector::Rustls(Arc::new(config)))
+}
+
 async fn connect_once(
     config: &OrchestratorConfig,
     registry: &Arc<CommandRegistry>,
     shell: &Arc<dyn PowerShellExecutor>,
 ) -> Result<()> {
     let request = connect_request(config)?;
-    let (stream, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .context("connecting to backend")?;
+    let (stream, _) = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        None,
+        false,
+        Some(tls_connector()?),
+    )
+    .await
+    .context("connecting to backend")?;
     tracing::info!(vm_id = %config.identity.vm_id, "connected to backend");
 
     let (mut write, mut read) = stream.split();

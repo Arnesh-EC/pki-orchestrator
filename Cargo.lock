@@ -602,6 +602,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "url",
+ "webpki-roots 0.26.11",
  "windows-service",
 ]
 

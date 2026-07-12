@@ -4,13 +4,12 @@ use pki_orchestrator::cli::{Cli, Command};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
-    // rustls 0.23 requires a process-level crypto provider chosen before the
-    // first TLS handshake. tokio-tungstenite's `rustls-tls-webpki-roots` feature
-    // pulls rustls without enabling its `ring`/`aws-lc-rs` feature, so the
-    // provider isn't auto-selected and `connect_async` panics on its first use.
-    // Install it here — the single entry point for both the CLI `connect` path
-    // and the SCM `service run` path. Ignore the error the second call would
-    // return if a provider is somehow already installed.
+    // Backstop only: install a process-level rustls crypto provider for any TLS
+    // path that resolves it globally. The phone-home connection does NOT rely on
+    // this — it passes an explicit provider via `builder_with_provider` (see
+    // `phonehome::tls_connector`), because in the release Windows build this
+    // global install was not observed at the connect site and rustls panicked on
+    // the first handshake. Ignore the error a redundant install would return.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
