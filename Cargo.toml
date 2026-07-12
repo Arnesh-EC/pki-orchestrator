@@ -24,6 +24,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Direct dep so we can install a process-level crypto provider explicitly:
+# tokio-tungstenite's rustls feature set doesn't enable rustls's own `ring`
+# feature, so rustls can't auto-select a provider and panics on the first TLS
+# handshake ("Could not automatically determine the process-level
+# CryptoProvider"). The `ring` feature exposes `rustls::crypto::ring`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
 futures-util = "0.3"
 url = "2"
 tempfile = "3"
