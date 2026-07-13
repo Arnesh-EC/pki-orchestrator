@@ -28,6 +28,7 @@
   "ocsp.install": "vm:provision",
   "ocsp.verify": "vm:read",
   "powershell.exec_arbitrary": "vm:exec-arbitrary",
+  "system.boot_info": "vm:read",
   "system.reboot": "vm:provision",
   "template.grant_access": "vm:provision"
 }

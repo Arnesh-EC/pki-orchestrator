@@ -79,6 +79,21 @@ fn guest_can_read_hostname() {
 }
 
 #[test]
+fn guest_can_read_boot_info() {
+    let registry = build_default_registry();
+    let shell = Arc::new(MockPowerShell::new());
+    shell.push_success(
+        r#"{"uptimeS":412,"finalizePending":false,"finalizeRunning":false}"#,
+    );
+    let sink = NullProgressSink;
+    let result = registry
+        .dispatch("system.boot_info", Role::Guest, HashMap::new(), &sink, shell)
+        .unwrap();
+    assert_eq!(result["uptimeS"], 412);
+    assert_eq!(result["finalizePending"], false);
+}
+
+#[test]
 fn guest_can_read_ip() {
     let registry = build_default_registry();
     let shell = Arc::new(MockPowerShell::new());
