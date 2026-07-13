@@ -162,11 +162,23 @@ fn tls_connector() -> Result<Connector> {
     Ok(Connector::Rustls(Arc::new(config)))
 }
 
+/// How a connection ended: a plain drop/close, or the backend's explicit
+/// "another connection took over this vm_id" close (code 4409) — a duplicate
+/// process on this machine or a copied ISO elsewhere. The latter gets a much
+/// longer backoff so two instances can't evict each other in a tight loop.
+enum ConnectionEnd {
+    Normal,
+    Superseded,
+}
+
+/// The backend's takeover close code (mirrors `routers/orchestrator.py`).
+const CLOSE_SUPERSEDED: u16 = 4409;
+
 async fn connect_once(
     config: &OrchestratorConfig,
     registry: &Arc<CommandRegistry>,
     shell: &Arc<dyn PowerShellExecutor>,
-) -> Result<()> {
+) -> Result<ConnectionEnd> {
     let request = connect_request(config)?;
     let (stream, _) = tokio_tungstenite::connect_async_tls_with_config(
         request,
@@ -208,9 +220,19 @@ async fn connect_once(
         }
     });
 
+    let mut end = ConnectionEnd::Normal;
     while let Some(frame) = read.next().await {
         let frame = frame.context("reading from backend")?;
-        let Message::Text(text) = frame else { continue };
+        let text = match frame {
+            Message::Text(text) => text,
+            Message::Close(Some(cf))
+                if u16::from(cf.code) == CLOSE_SUPERSEDED =>
+            {
+                end = ConnectionEnd::Superseded;
+                break;
+            }
+            _ => continue,
+        };
 
         let cmd: InboundCommand = match serde_json::from_str(&text) {
             Ok(cmd) => cmd,
@@ -230,7 +252,7 @@ async fn connect_once(
 
     drop(tx);
     let _ = writer.await;
-    Ok(())
+    Ok(end)
 }
 
 /// Client→server WebSocket ping cadence. A long, quiet command produces no
@@ -239,6 +261,10 @@ async fn connect_once(
 const KEEPALIVE_PING_SECS: u64 = 30;
 
 const RECONNECT_DELAYS_SECS: [u64; 5] = [1, 2, 5, 10, 30];
+
+/// Backoff after a 4409 supersede — long enough that two instances fighting
+/// over one vm_id can't keep evicting each other every couple of seconds.
+const SUPERSEDED_DELAY_SECS: u64 = 300;
 
 /// Connects, dispatches, and reconnects with capped backoff forever. Only
 /// returns if the config itself is unusable (e.g. no `backend.url`) — a
@@ -253,7 +279,17 @@ pub async fn run_forever(
     let mut attempt = 0usize;
     loop {
         match connect_once(config, &registry, &shell).await {
-            Ok(()) => {
+            Ok(ConnectionEnd::Superseded) => {
+                tracing::warn!(
+                    "backend superseded this connection: another agent \
+                     instance is using this vm_id (duplicate process or \
+                     copied ISO) — backing off {SUPERSEDED_DELAY_SECS}s"
+                );
+                tokio::time::sleep(Duration::from_secs(SUPERSEDED_DELAY_SECS))
+                    .await;
+                continue;
+            }
+            Ok(ConnectionEnd::Normal) => {
                 tracing::warn!("backend closed the connection; reconnecting")
             }
             Err(err) => tracing::warn!(
