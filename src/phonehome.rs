@@ -174,10 +174,35 @@ enum ConnectionEnd {
 /// The backend's takeover close code (mirrors `routers/orchestrator.py`).
 const CLOSE_SUPERSEDED: u16 = 4409;
 
+/// Serialize and send one progress frame. On a write failure the frame is
+/// parked in `pending` for the next connection — a long command's terminal
+/// result must survive the socket it started on. Returns whether the
+/// connection is still usable.
+async fn send_progress<S>(
+    write: &mut S,
+    msg: OutboundProgress,
+    pending: &mut Option<OutboundProgress>,
+) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let Ok(text) = serde_json::to_string(&msg) else {
+        return true; // unserializable frame — a bug; drop it, keep the socket
+    };
+    if write.send(Message::Text(text)).await.is_err() {
+        *pending = Some(msg);
+        return false;
+    }
+    true
+}
+
 async fn connect_once(
     config: &OrchestratorConfig,
     registry: &Arc<CommandRegistry>,
     shell: &Arc<dyn PowerShellExecutor>,
+    tx: &mpsc::UnboundedSender<OutboundProgress>,
+    rx: &mut mpsc::UnboundedReceiver<OutboundProgress>,
+    pending: &mut Option<OutboundProgress>,
 ) -> Result<ConnectionEnd> {
     let request = connect_request(config)?;
     let (stream, _) = tokio_tungstenite::connect_async_tls_with_config(
@@ -191,68 +216,72 @@ async fn connect_once(
     tracing::info!(vm_id = %config.identity.vm_id, "connected to backend");
 
     let (mut write, mut read) = stream.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<OutboundProgress>();
 
-    let writer = tokio::spawn(async move {
-        let mut ping =
-            tokio::time::interval(Duration::from_secs(KEEPALIVE_PING_SECS));
-        ping.tick().await; // the first tick fires immediately — skip it
-        loop {
-            tokio::select! {
-                msg = rx.recv() => {
-                    let Some(msg) = msg else { break };
-                    let Ok(text) = serde_json::to_string(&msg) else {
+    // A frame the previous connection accepted but failed to write — deliver
+    // it before anything else (frames queued in `rx` while disconnected
+    // follow naturally via the select loop).
+    if let Some(msg) = pending.take() {
+        if !send_progress(&mut write, msg, pending).await {
+            return Ok(ConnectionEnd::Normal);
+        }
+    }
+
+    let mut ping =
+        tokio::time::interval(Duration::from_secs(KEEPALIVE_PING_SECS));
+    ping.tick().await; // the first tick fires immediately — skip it
+
+    loop {
+        tokio::select! {
+            frame = read.next() => {
+                let Some(frame) = frame else {
+                    return Ok(ConnectionEnd::Normal);
+                };
+                let frame = frame.context("reading from backend")?;
+                let text = match frame {
+                    Message::Text(text) => text,
+                    Message::Close(Some(cf))
+                        if u16::from(cf.code) == CLOSE_SUPERSEDED =>
+                    {
+                        return Ok(ConnectionEnd::Superseded);
+                    }
+                    _ => continue,
+                };
+
+                let cmd: InboundCommand = match serde_json::from_str(&text) {
+                    Ok(cmd) => cmd,
+                    Err(err) => {
+                        tracing::warn!(?err, "received malformed command frame");
                         continue;
-                    };
-                    if write.send(Message::Text(text)).await.is_err() {
-                        break;
                     }
+                };
+
+                let registry = Arc::clone(registry);
+                let shell = Arc::clone(shell);
+                let tx = tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    handle_command(&registry, shell, cmd, &tx);
+                });
+            }
+            msg = rx.recv() => {
+                // `run_forever` holds a sender for the process lifetime, so
+                // recv only yields None at shutdown.
+                let Some(msg) = msg else {
+                    return Ok(ConnectionEnd::Normal);
+                };
+                if !send_progress(&mut write, msg, pending).await {
+                    return Ok(ConnectionEnd::Normal);
                 }
-                _ = ping.tick() => {
-                    // A long, quiet command sends no frames; a periodic ping
-                    // keeps the connection from being dropped by an idle-timeout
-                    // in a reverse proxy / tunnel between us and the backend.
-                    if write.send(Message::Ping(Vec::new())).await.is_err() {
-                        break;
-                    }
+            }
+            _ = ping.tick() => {
+                // A long, quiet command sends no frames; a periodic ping
+                // keeps the connection from being dropped by an idle-timeout
+                // in a reverse proxy / tunnel between us and the backend.
+                if write.send(Message::Ping(Vec::new())).await.is_err() {
+                    return Ok(ConnectionEnd::Normal);
                 }
             }
         }
-    });
-
-    let mut end = ConnectionEnd::Normal;
-    while let Some(frame) = read.next().await {
-        let frame = frame.context("reading from backend")?;
-        let text = match frame {
-            Message::Text(text) => text,
-            Message::Close(Some(cf))
-                if u16::from(cf.code) == CLOSE_SUPERSEDED =>
-            {
-                end = ConnectionEnd::Superseded;
-                break;
-            }
-            _ => continue,
-        };
-
-        let cmd: InboundCommand = match serde_json::from_str(&text) {
-            Ok(cmd) => cmd,
-            Err(err) => {
-                tracing::warn!(?err, "received malformed command frame");
-                continue;
-            }
-        };
-
-        let registry = Arc::clone(registry);
-        let shell = Arc::clone(shell);
-        let tx = tx.clone();
-        tokio::task::spawn_blocking(move || {
-            handle_command(&registry, shell, cmd, &tx);
-        });
     }
-
-    drop(tx);
-    let _ = writer.await;
-    Ok(end)
 }
 
 /// Client→server WebSocket ping cadence. A long, quiet command produces no
@@ -281,10 +310,19 @@ pub async fn run_forever(
 ) -> Result<()> {
     connect_url(config)?; // fail fast on bad config, before the first attempt
 
+    // Outbound frames outlive any one connection: a command started on one
+    // socket delivers its result through whichever socket is live when it
+    // finishes (frames queue here while disconnected, plus a one-slot
+    // `pending` for a frame that failed mid-write).
+    let (tx, mut rx) = mpsc::unbounded_channel::<OutboundProgress>();
+    let mut pending: Option<OutboundProgress> = None;
+
     let mut attempt = 0usize;
     loop {
         let started = std::time::Instant::now();
-        let outcome = connect_once(config, &registry, &shell).await;
+        let outcome =
+            connect_once(config, &registry, &shell, &tx, &mut rx, &mut pending)
+                .await;
         if started.elapsed() >= Duration::from_secs(HEALTHY_CONNECTION_SECS) {
             attempt = 0;
         }
