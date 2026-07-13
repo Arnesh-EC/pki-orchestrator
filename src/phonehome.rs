@@ -182,12 +182,28 @@ async fn connect_once(
     let (tx, mut rx) = mpsc::unbounded_channel::<OutboundProgress>();
 
     let writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let Ok(text) = serde_json::to_string(&msg) else {
-                continue;
-            };
-            if write.send(Message::Text(text)).await.is_err() {
-                break;
+        let mut ping =
+            tokio::time::interval(Duration::from_secs(KEEPALIVE_PING_SECS));
+        ping.tick().await; // the first tick fires immediately — skip it
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    let Ok(text) = serde_json::to_string(&msg) else {
+                        continue;
+                    };
+                    if write.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                _ = ping.tick() => {
+                    // A long, quiet command sends no frames; a periodic ping
+                    // keeps the connection from being dropped by an idle-timeout
+                    // in a reverse proxy / tunnel between us and the backend.
+                    if write.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -216,6 +232,11 @@ async fn connect_once(
     let _ = writer.await;
     Ok(())
 }
+
+/// Client→server WebSocket ping cadence. A long, quiet command produces no
+/// frames, so without this the connection can be dropped by an idle-timeout in
+/// a reverse proxy / tunnel (e.g. Cloudflare) sitting between agent and backend.
+const KEEPALIVE_PING_SECS: u64 = 30;
 
 const RECONNECT_DELAYS_SECS: [u64; 5] = [1, 2, 5, 10, 30];
 
