@@ -266,6 +266,11 @@ const RECONNECT_DELAYS_SECS: [u64; 5] = [1, 2, 5, 10, 30];
 /// over one vm_id can't keep evicting each other every couple of seconds.
 const SUPERSEDED_DELAY_SECS: u64 = 300;
 
+/// A connection that lived at least this long counts as healthy, resetting
+/// the reconnect backoff — without this, `attempt` only ever grows and every
+/// later drop (even after days of uptime) starts at the 30s cap.
+const HEALTHY_CONNECTION_SECS: u64 = 60;
+
 /// Connects, dispatches, and reconnects with capped backoff forever. Only
 /// returns if the config itself is unusable (e.g. no `backend.url`) — a
 /// dropped connection is retried, never treated as fatal.
@@ -278,7 +283,12 @@ pub async fn run_forever(
 
     let mut attempt = 0usize;
     loop {
-        match connect_once(config, &registry, &shell).await {
+        let started = std::time::Instant::now();
+        let outcome = connect_once(config, &registry, &shell).await;
+        if started.elapsed() >= Duration::from_secs(HEALTHY_CONNECTION_SECS) {
+            attempt = 0;
+        }
+        match outcome {
             Ok(ConnectionEnd::Superseded) => {
                 tracing::warn!(
                     "backend superseded this connection: another agent \
