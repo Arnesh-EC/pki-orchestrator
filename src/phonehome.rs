@@ -455,6 +455,13 @@ mod tests {
         let frames = recv_all(&mut rx);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].state.status, crate::report::OpStatus::Error);
+        // The backend's boot-probe fallback matches this exact wording to
+        // detect an agent that predates a command — it is a compatibility
+        // surface, not just a message.
+        assert_eq!(
+            frames[0].state.detail.as_deref(),
+            Some("unknown command 'does.not_exist'")
+        );
     }
 
     #[test]
