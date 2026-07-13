@@ -32,6 +32,7 @@ fn acquire_instance_lock() -> Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(false)
         .share_mode(0)
         .open(dir.join("agent.lock"))
         .context(
