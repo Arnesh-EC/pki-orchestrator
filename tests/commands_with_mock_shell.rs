@@ -87,7 +87,13 @@ fn guest_can_read_boot_info() {
     );
     let sink = NullProgressSink;
     let result = registry
-        .dispatch("system.boot_info", Role::Guest, HashMap::new(), &sink, shell)
+        .dispatch(
+            "system.boot_info",
+            Role::Guest,
+            HashMap::new(),
+            &sink,
+            shell,
+        )
         .unwrap();
     assert_eq!(result["uptimeS"], 412);
     assert_eq!(result["finalizePending"], false);

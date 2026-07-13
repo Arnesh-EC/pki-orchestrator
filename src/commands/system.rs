@@ -8,7 +8,7 @@
 //! phone-home. The `shutdown /r /t <delay>` grace window is what lets the
 //! done-frame flush over the socket before the OS goes down.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
     authz::Capability,
@@ -249,9 +249,6 @@ mod tests {
 
     #[test]
     fn boot_info_is_read_tier() {
-        assert_eq!(
-            SystemBootInfo.required_capability(),
-            Capability::VmRead
-        );
+        assert_eq!(SystemBootInfo.required_capability(), Capability::VmRead);
     }
 }
