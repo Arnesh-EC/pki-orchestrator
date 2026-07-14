@@ -52,7 +52,7 @@ fn guest_cannot_rename_hostname() {
 fn guest_can_verify_cert() {
     let registry = build_default_registry();
     let shell = Arc::new(MockPowerShell::new());
-    shell.push_success("CertUtil: -verify command completed successfully.");
+    shell.push_success(r#"{"chain_ok":true,"healthy":true}"#);
     let sink = NullProgressSink;
     let result = registry
         .dispatch(

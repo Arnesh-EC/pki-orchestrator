@@ -398,9 +398,7 @@ mod tests {
     fn allowed_command_forwards_the_handlers_own_progress_and_done_frames() {
         let registry = build_default_registry();
         let shell = Arc::new(MockPowerShell::new());
-        shell.push_success(
-            "...\nCertUtil: -verify command completed successfully.\n",
-        );
+        shell.push_success(r#"{"chain_ok":true,"healthy":true}"#);
         let shell: Arc<dyn PowerShellExecutor> = shell;
         let (tx, mut rx) = mpsc::unbounded_channel();
 
