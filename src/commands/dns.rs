@@ -50,7 +50,7 @@ fn valid_reverse_zone(value: &str) -> bool {
         return false;
     };
     let labels: Vec<_> = prefix.split('.').collect();
-    (1..=4).contains(&labels.len())
+    (1..=3).contains(&labels.len())
         && labels.iter().all(|label| label.parse::<u8>().is_ok())
 }
 
