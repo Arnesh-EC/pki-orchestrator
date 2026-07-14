@@ -8,15 +8,118 @@
 
 use std::net::Ipv4Addr;
 
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
     authz::Capability,
     commands::util::{
-        invalid, param, require_success, required, valid_dns_name,
+        invalid, param, parse_json, require_success, required, valid_dns_name,
     },
     registry::{CommandContext, CommandError, CommandHandler},
 };
+
+const MAX_DNS_RESOURCES: usize = 32;
+
+#[derive(Clone, Deserialize)]
+enum PlannedDnsKind {
+    #[serde(rename = "A")]
+    A,
+    #[serde(rename = "PTR")]
+    Ptr,
+    #[serde(rename = "CNAME")]
+    Cname,
+}
+
+#[derive(Clone, Deserialize)]
+struct PlannedDnsRecord {
+    id: String,
+    kind: PlannedDnsKind,
+    zone: String,
+    name: String,
+    value: String,
+}
+
+fn valid_single_label(value: &str) -> bool {
+    valid_dns_name(value) && !value.contains('.')
+}
+
+fn valid_reverse_zone(value: &str) -> bool {
+    let normalized = value.trim_end_matches('.').to_ascii_lowercase();
+    let Some(prefix) = normalized.strip_suffix(".in-addr.arpa") else {
+        return false;
+    };
+    let labels: Vec<_> = prefix.split('.').collect();
+    (1..=4).contains(&labels.len())
+        && labels.iter().all(|label| label.parse::<u8>().is_ok())
+}
+
+fn parse_planned_records(
+    ctx: &CommandContext,
+) -> Result<(String, Vec<PlannedDnsRecord>), CommandError> {
+    let raw = required(ctx, "records")?;
+    if raw.len() > 32 * 1024 {
+        return Err(invalid("records", "JSON payload is too large"));
+    }
+    let records: Vec<PlannedDnsRecord> =
+        serde_json::from_str(raw).map_err(|_| {
+            invalid("records", "must be a JSON array of DNS resources")
+        })?;
+    if records.is_empty() || records.len() > MAX_DNS_RESOURCES {
+        return Err(invalid(
+            "records",
+            "must contain between 1 and 32 resources",
+        ));
+    }
+    for record in &records {
+        if record.id.is_empty()
+            || record.id.len() > 500
+            || !record
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ":_-".contains(c))
+        {
+            return Err(invalid("records", "contains an invalid resource id"));
+        }
+        if !valid_dns_name(&record.zone) {
+            return Err(invalid("records", "contains an invalid DNS zone"));
+        }
+        match record.kind {
+            PlannedDnsKind::A => {
+                if !valid_single_label(&record.name)
+                    || record.value.parse::<Ipv4Addr>().is_err()
+                {
+                    return Err(invalid(
+                        "records",
+                        "contains an invalid A record",
+                    ));
+                }
+            }
+            PlannedDnsKind::Ptr => {
+                if !valid_reverse_zone(&record.zone)
+                    || record.name.parse::<Ipv4Addr>().is_err()
+                    || !valid_dns_name(&record.value)
+                {
+                    return Err(invalid(
+                        "records",
+                        "contains an invalid PTR record",
+                    ));
+                }
+            }
+            PlannedDnsKind::Cname => {
+                if !valid_single_label(&record.name)
+                    || !valid_dns_name(&record.value)
+                {
+                    return Err(invalid(
+                        "records",
+                        "contains an invalid CNAME record",
+                    ));
+                }
+            }
+        }
+    }
+    Ok((raw.to_string(), records))
+}
 
 /// `Set-DnsClientServerAddress` — replace a NIC's DNS server list.
 pub struct DnsSetClient;
@@ -133,6 +236,199 @@ impl CommandHandler for DnsCreateRecord {
         });
         ctx.progress
             .report(crate::report::OpRunState::done(result.clone()));
+        Ok(result)
+    }
+}
+
+/// Apply explicit A/PTR/CNAME plan resources on the authoritative DC.
+/// Existing identical values are retained; a different pre-existing value is
+/// a hard conflict so a deploy never takes ownership by silently replacing it.
+pub struct DnsApplyResources;
+
+impl CommandHandler for DnsApplyResources {
+    fn name(&self) -> &'static str {
+        "dns.apply_resources"
+    }
+
+    fn required_capability(&self) -> Capability {
+        Capability::VmProvision
+    }
+
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+    ) -> Result<serde_json::Value, CommandError> {
+        let (records_json, records) = parse_planned_records(ctx)?;
+        ctx.progress.report(crate::report::OpRunState::running(
+            "applying DNS resources",
+            30.0,
+        ));
+
+        let script = r#"param([string]$RecordsJson)
+$ErrorActionPreference = 'Stop'
+Import-Module DnsServer
+$records = @($RecordsJson | ConvertFrom-Json)
+$results = foreach ($record in $records) {
+    $zone = [string]$record.zone
+    $name = [string]$record.name
+    $value = [string]$record.value
+    if ($record.kind -eq 'PTR') {
+        $existingZone = Get-DnsServerZone -Name $zone -ErrorAction SilentlyContinue
+        if (-not $existingZone) {
+            $prefixLabels = @($zone.ToLowerInvariant().Replace('.in-addr.arpa','').Split('.'))
+            [array]::Reverse($prefixLabels)
+            $networkOctets = @($prefixLabels)
+            while ($networkOctets.Count -lt 4) { $networkOctets += '0' }
+            $networkId = ($networkOctets -join '.') + '/' + ($prefixLabels.Count * 8)
+            Add-DnsServerPrimaryZone -NetworkId $networkId -ReplicationScope Forest | Out-Null
+        }
+        $prefixCount = @($zone.ToLowerInvariant().Replace('.in-addr.arpa','').Split('.')).Count
+        $remaining = @($name.Split('.')[$prefixCount..3])
+        [array]::Reverse($remaining)
+        $relativeName = $remaining -join '.'
+        $existing = @(Get-DnsServerResourceRecord -ZoneName $zone -Name $relativeName -RRType PTR -ErrorAction SilentlyContinue)
+        $actual = @($existing | ForEach-Object { $_.RecordData.PtrDomainName.TrimEnd('.') })
+        $expected = $value.TrimEnd('.')
+        if ($existing.Count -gt 0 -and -not ($actual.Count -eq 1 -and $actual[0] -ieq $expected)) {
+            throw "DNS conflict for PTR $name: expected $value; found $($actual -join ',')"
+        }
+        if ($existing.Count -eq 0) {
+            Add-DnsServerResourceRecordPtr -ZoneName $zone -Name $relativeName -PtrDomainName $value | Out-Null
+            $status = 'created'
+        } else { $status = 'retained' }
+    } elseif ($record.kind -eq 'A') {
+        $existing = @(Get-DnsServerResourceRecord -ZoneName $zone -Name $name -RRType A -ErrorAction SilentlyContinue)
+        $actual = @($existing | ForEach-Object { $_.RecordData.IPv4Address.IPAddressToString })
+        if ($existing.Count -gt 0 -and -not ($actual.Count -eq 1 -and $actual[0] -eq $value)) {
+            throw "DNS conflict for A $name.$zone: expected $value; found $($actual -join ',')"
+        }
+        if ($existing.Count -eq 0) {
+            Add-DnsServerResourceRecordA -ZoneName $zone -Name $name -IPv4Address $value | Out-Null
+            $status = 'created'
+        } else { $status = 'retained' }
+    } elseif ($record.kind -eq 'CNAME') {
+        $existing = @(Get-DnsServerResourceRecord -ZoneName $zone -Name $name -RRType CNAME -ErrorAction SilentlyContinue)
+        $actual = @($existing | ForEach-Object { $_.RecordData.HostNameAlias.TrimEnd('.') })
+        $expected = $value.TrimEnd('.')
+        if ($existing.Count -gt 0 -and -not ($actual.Count -eq 1 -and $actual[0] -ieq $expected)) {
+            throw "DNS conflict for CNAME $name.$zone: expected $value; found $($actual -join ',')"
+        }
+        if ($existing.Count -eq 0) {
+            Add-DnsServerResourceRecordCName -ZoneName $zone -Name $name -HostNameAlias $value | Out-Null
+            $status = 'created'
+        } else { $status = 'retained' }
+    } else { throw "Unsupported DNS resource kind '$($record.kind)'" }
+    [pscustomobject]@{ id = [string]$record.id; kind = [string]$record.kind; status = $status }
+}
+[pscustomobject]@{ applied = @($results).Count; records = @($results) } | ConvertTo-Json -Depth 5 -Compress"#;
+        let output = require_success(ctx.shell.run(script, &[records_json])?)?;
+        let readback = parse_json(&output.stdout);
+        let result = json!({
+            "applied": records.len(),
+            "readback": readback,
+        });
+        ctx.progress
+            .report(crate::report::OpRunState::done(result.clone()));
+        Ok(result)
+    }
+}
+
+/// Resolve every planned record through the requested DNS server, optionally
+/// prove the forest's essential AD SRV registrations and an HTTP publication
+/// URL. The PowerShell command exits non-zero on any mismatch, making this a
+/// deployment gate rather than a best-effort observation.
+pub struct DnsVerify;
+
+impl CommandHandler for DnsVerify {
+    fn name(&self) -> &'static str {
+        "dns.verify"
+    }
+
+    fn required_capability(&self) -> Capability {
+        Capability::VmRead
+    }
+
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+    ) -> Result<serde_json::Value, CommandError> {
+        let (records_json, records) = parse_planned_records(ctx)?;
+        let server = required(ctx, "server")?;
+        if server.parse::<Ipv4Addr>().is_err() && !valid_dns_name(server) {
+            return Err(invalid(
+                "server",
+                "must be an IPv4 address or DNS name",
+            ));
+        }
+        let require_ad_srv = param(ctx, "requireAdSrv").unwrap_or("false");
+        if require_ad_srv != "true" && require_ad_srv != "false" {
+            return Err(invalid("requireAdSrv", "must be true or false"));
+        }
+        let domain = param(ctx, "domain").unwrap_or_default();
+        if require_ad_srv == "true" && !valid_dns_name(domain) {
+            return Err(invalid("domain", "must be a DNS domain name"));
+        }
+        let http_url = param(ctx, "httpUrl").unwrap_or_default();
+        if !http_url.is_empty()
+            && (!(http_url.starts_with("http://")
+                || http_url.starts_with("https://"))
+                || http_url.len() > 300
+                || http_url.chars().any(|c| "\"'`;$ \r\n".contains(c)))
+        {
+            return Err(invalid("httpUrl", "must be a safe HTTP(S) URL"));
+        }
+
+        ctx.progress.report(crate::report::OpRunState::running(
+            "verifying DNS resources",
+            30.0,
+        ));
+        let script = r#"param([string]$RecordsJson,[string]$Server,[string]$RequireAdSrv,[string]$Domain,[string]$HttpUrl)
+$ErrorActionPreference = 'Stop'
+$records = @($RecordsJson | ConvertFrom-Json)
+$checks = foreach ($record in $records) {
+    if ($record.kind -eq 'PTR') {
+        $answer = @(Resolve-DnsName -Name ([string]$record.name) -Type PTR -Server $Server -DnsOnly -NoHostsFile)
+        $actual = @($answer | Where-Object Type -eq PTR | ForEach-Object { $_.NameHost.TrimEnd('.') })
+        $expected = ([string]$record.value).TrimEnd('.')
+    } else {
+        $fqdn = ([string]$record.name) + '.' + ([string]$record.zone)
+        $answer = @(Resolve-DnsName -Name $fqdn -Type ([string]$record.kind) -Server $Server -DnsOnly -NoHostsFile)
+        if ($record.kind -eq 'A') { $actual = @($answer | Where-Object Type -eq A | ForEach-Object IPAddress); $expected = [string]$record.value }
+        else { $actual = @($answer | Where-Object Type -eq CNAME | ForEach-Object { $_.NameHost.TrimEnd('.') }); $expected = ([string]$record.value).TrimEnd('.') }
+    }
+    $ok = @($actual | Where-Object { $_ -ieq $expected }).Count -gt 0
+    [pscustomobject]@{ id = [string]$record.id; kind = [string]$record.kind; ok = $ok; expected = $expected; actual = @($actual) }
+}
+$adSrvOk = $true
+$srvChecks = @()
+if ($RequireAdSrv -eq 'true') {
+    $srvNames = @("_ldap._tcp.$Domain", "_kerberos._tcp.$Domain", "_ldap._tcp.dc._msdcs.$Domain")
+    $srvChecks = @($srvNames | ForEach-Object {
+        $answers = @(Resolve-DnsName -Name $_ -Type SRV -Server $Server -DnsOnly -NoHostsFile)
+        [pscustomobject]@{ name = $_; ok = @($answers | Where-Object Type -eq SRV).Count -gt 0 }
+    })
+    $adSrvOk = @($srvChecks | Where-Object { -not $_.ok }).Count -eq 0
+}
+$httpOk = $true
+if ($HttpUrl) {
+    $response = Invoke-WebRequest -Uri $HttpUrl -UseBasicParsing -TimeoutSec 30
+    $httpOk = [int]$response.StatusCode -ge 200 -and [int]$response.StatusCode -lt 400
+}
+$allVerified = @($checks | Where-Object { -not $_.ok }).Count -eq 0
+if (-not $allVerified -or -not $adSrvOk -or -not $httpOk) { throw 'DNS verification failed' }
+[pscustomobject]@{ all_verified = $allVerified; ad_srv_ok = $adSrvOk; http_ok = $httpOk; records = @($checks); srv = @($srvChecks) } | ConvertTo-Json -Depth 6 -Compress"#;
+        let args = [
+            records_json,
+            server.to_string(),
+            require_ad_srv.to_string(),
+            domain.to_string(),
+            http_url.to_string(),
+        ];
+        let output = require_success(ctx.shell.run(script, &args)?)?;
+        let result = parse_json(&output.stdout);
+        ctx.progress
+            .report(crate::report::OpRunState::done(result.clone()));
+        let _ = records;
         Ok(result)
     }
 }
@@ -284,5 +580,87 @@ mod tests {
         let result = DnsCreateRecord.execute(&ctx).unwrap();
         assert_eq!(result["name"], "pki");
         assert_eq!(result["applied"], "srv1.EncryptionConsulting.com.");
+    }
+
+    fn planned_records_json() -> &'static str {
+        r#"[{"id":"dns:a:dc:web","kind":"A","zone":"encon.pki","name":"srv1","value":"192.168.1.92"},{"id":"dns:ptr:dc:web","kind":"PTR","zone":"1.168.192.in-addr.arpa","name":"192.168.1.92","value":"srv1.encon.pki."},{"id":"dns:cname:dc:pki","kind":"CNAME","zone":"encon.pki","name":"pki","value":"srv1.encon.pki."}]"#
+    }
+
+    #[test]
+    fn apply_resources_validates_and_reports_readback() {
+        let params = ctx_params(&[("records", planned_records_json())]);
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success(
+            r#"{"applied":3,"records":[{"id":"dns:a:dc:web","status":"created"}]}"#,
+        );
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell,
+        };
+        let result = DnsApplyResources.execute(&ctx).unwrap();
+        assert_eq!(result["applied"], 3);
+        assert_eq!(result["readback"]["applied"], 3);
+    }
+
+    #[test]
+    fn apply_resources_rejects_invalid_ptr_zone() {
+        let records = r#"[{"id":"dns:ptr:dc:web","kind":"PTR","zone":"encon.pki","name":"192.168.1.92","value":"srv1.encon.pki."}]"#;
+        let params = ctx_params(&[("records", records)]);
+        let sink = NullProgressSink;
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell: Arc::new(MockPowerShell::new()),
+        };
+        assert!(matches!(
+            DnsApplyResources.execute(&ctx),
+            Err(CommandError::InvalidParam { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_accepts_srv_and_http_checks() {
+        let params = ctx_params(&[
+            ("records", planned_records_json()),
+            ("server", "192.168.1.90"),
+            ("requireAdSrv", "true"),
+            ("domain", "encon.pki"),
+            ("httpUrl", "http://pki.encon.pki/CertEnroll/"),
+        ]);
+        let sink = NullProgressSink;
+        let shell = Arc::new(MockPowerShell::new());
+        shell.push_success(
+            r#"{"all_verified":true,"ad_srv_ok":true,"http_ok":true}"#,
+        );
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell,
+        };
+        let result = DnsVerify.execute(&ctx).unwrap();
+        assert_eq!(result["all_verified"], true);
+        assert_eq!(result["ad_srv_ok"], true);
+        assert_eq!(result["http_ok"], true);
+    }
+
+    #[test]
+    fn verify_rejects_unsafe_http_url() {
+        let params = ctx_params(&[
+            ("records", planned_records_json()),
+            ("server", "192.168.1.90"),
+            ("httpUrl", "http://pki.encon.pki/;Remove-Item"),
+        ]);
+        let sink = NullProgressSink;
+        let ctx = CommandContext {
+            params: &params,
+            progress: &sink,
+            shell: Arc::new(MockPowerShell::new()),
+        };
+        assert!(matches!(
+            DnsVerify.execute(&ctx),
+            Err(CommandError::InvalidParam { .. })
+        ));
     }
 }

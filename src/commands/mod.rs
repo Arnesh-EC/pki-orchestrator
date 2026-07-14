@@ -51,6 +51,8 @@ pub fn build_default_registry() -> CommandRegistry {
     registry.register(Box::new(system::SystemBootInfo::default()));
     registry.register(Box::new(dns::DnsSetClient));
     registry.register(Box::new(dns::DnsCreateRecord));
+    registry.register(Box::new(dns::DnsApplyResources));
+    registry.register(Box::new(dns::DnsVerify));
     registry.register(Box::new(cert_store::CertAddStore));
     registry.register(Box::new(cert_store::CertDsPublish));
     registry.register(Box::new(template::TemplateGrantAccess));
