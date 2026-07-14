@@ -67,6 +67,32 @@ fn guest_can_verify_cert() {
 }
 
 #[test]
+fn guest_can_verify_enterprise_pki() {
+    let registry = build_default_registry();
+    let shell = Arc::new(MockPowerShell::new());
+    shell.push_success(r#"{"healthy":true}"#);
+    let sink = NullProgressSink;
+    let result = registry
+        .dispatch(
+            "pki.verify",
+            Role::Guest,
+            params(&[
+                ("rootCaCommonName", "EC-Root-CA"),
+                ("issuingCaCommonName", "EC-Issuing-CA"),
+                ("templates", "OCSPResponseSigning,Workstation"),
+                (
+                    "httpUrls",
+                    r#"["http://pki.encon.test/CertEnroll/root.crt"]"#,
+                ),
+            ]),
+            &sink,
+            shell,
+        )
+        .unwrap();
+    assert_eq!(result["healthy"], true);
+}
+
+#[test]
 fn guest_can_read_hostname() {
     let registry = build_default_registry();
     let shell = Arc::new(MockPowerShell::new());

@@ -12,6 +12,7 @@ mod hostname_rename;
 mod iis;
 mod ip;
 mod ocsp;
+mod pki_verify;
 mod system;
 mod template;
 pub(crate) mod util;
@@ -61,5 +62,6 @@ pub fn build_default_registry() -> CommandRegistry {
     registry.register(Box::new(ocsp::OcspConfigureRevocation));
     registry.register(Box::new(ocsp::OcspVerify));
     registry.register(Box::new(cert_enroll::CertEnroll));
+    registry.register(Box::new(pki_verify::PkiVerify));
     registry
 }
