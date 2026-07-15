@@ -290,7 +290,7 @@ $results = foreach ($record in $records) {
         $actual = @($existing | ForEach-Object { $_.RecordData.PtrDomainName.TrimEnd('.') })
         $expected = $value.TrimEnd('.')
         if ($existing.Count -gt 0 -and -not ($actual.Count -eq 1 -and $actual[0] -ieq $expected)) {
-            throw "DNS conflict for PTR $name: expected $value; found $($actual -join ',')"
+            throw "DNS conflict for PTR ${name}: expected $value; found $($actual -join ',')"
         }
         if ($existing.Count -eq 0) {
             Add-DnsServerResourceRecordPtr -ZoneName $zone -Name $relativeName -PtrDomainName $value | Out-Null
@@ -300,7 +300,7 @@ $results = foreach ($record in $records) {
         $existing = @(Get-DnsServerResourceRecord -ZoneName $zone -Name $name -RRType A -ErrorAction SilentlyContinue)
         $actual = @($existing | ForEach-Object { $_.RecordData.IPv4Address.IPAddressToString })
         if ($existing.Count -gt 0 -and -not ($actual.Count -eq 1 -and $actual[0] -eq $value)) {
-            throw "DNS conflict for A $name.$zone: expected $value; found $($actual -join ',')"
+            throw "DNS conflict for A $name.${zone}: expected $value; found $($actual -join ',')"
         }
         if ($existing.Count -eq 0) {
             Add-DnsServerResourceRecordA -ZoneName $zone -Name $name -IPv4Address $value | Out-Null
@@ -311,7 +311,7 @@ $results = foreach ($record in $records) {
         $actual = @($existing | ForEach-Object { $_.RecordData.HostNameAlias.TrimEnd('.') })
         $expected = $value.TrimEnd('.')
         if ($existing.Count -gt 0 -and -not ($actual.Count -eq 1 -and $actual[0] -ieq $expected)) {
-            throw "DNS conflict for CNAME $name.$zone: expected $value; found $($actual -join ',')"
+            throw "DNS conflict for CNAME $name.${zone}: expected $value; found $($actual -join ',')"
         }
         if ($existing.Count -eq 0) {
             Add-DnsServerResourceRecordCName -ZoneName $zone -Name $name -HostNameAlias $value | Out-Null
@@ -597,11 +597,17 @@ mod tests {
         let ctx = CommandContext {
             params: &params,
             progress: &sink,
-            shell,
+            shell: shell.clone(),
         };
         let result = DnsApplyResources.execute(&ctx).unwrap();
         assert_eq!(result["applied"], 3);
         assert_eq!(result["readback"]["applied"], 3);
+
+        let calls = shell.calls.lock().unwrap();
+        let script = &calls[0];
+        assert!(script.contains("DNS conflict for PTR ${name}:"));
+        assert!(script.contains("DNS conflict for A $name.${zone}:"));
+        assert!(script.contains("DNS conflict for CNAME $name.${zone}:"));
     }
 
     #[test]
