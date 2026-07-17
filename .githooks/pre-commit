@@ -1,0 +1,25 @@
+#!/bin/sh
+# Pre-commit hook: enforce formatting and passing tests before a commit lands.
+# Mirrors the format + test gates in .github/workflows/ci.yml so failures are
+# caught locally instead of in CI.
+#
+# Enable once per clone with:
+#   git config core.hooksPath .githooks
+#
+# Bypass for a single commit with `git commit --no-verify`.
+set -e
+
+echo "pre-commit: checking formatting (cargo fmt --all -- --check)"
+if ! cargo fmt --all -- --check; then
+	echo
+	echo "pre-commit: formatting check failed. Run 'cargo fmt --all' and re-stage." >&2
+	exit 1
+fi
+
+echo "pre-commit: running clippy (cargo clippy --all-targets -- -D warnings)"
+cargo clippy --all-targets -- -D warnings
+
+echo "pre-commit: running tests (cargo test --all-targets)"
+cargo test --all-targets
+
+echo "pre-commit: ok"

@@ -205,3 +205,16 @@ running backend, and Windows Service Control Manager lifecycle are exercised
 only in CI's `windows-latest` job / manual testing — see the CI workflow for
 what actually runs where, and the top-level plan's Verification section for
 the manual end-to-end phone-home walkthrough.
+
+### Pre-commit hook
+
+A pre-commit hook in `.githooks/pre-commit` mirrors CI's format, lint, and
+test gates (`cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D
+warnings`, and `cargo test --all-targets`) so failures are caught before they
+reach CI. Enable it once per clone:
+
+```
+git config core.hooksPath .githooks
+```
+
+Bypass it for a single commit with `git commit --no-verify`.
